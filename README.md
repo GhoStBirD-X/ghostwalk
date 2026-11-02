@@ -4,9 +4,12 @@ Pencatat olahraga yang **pribadi dan offline** untuk Android dan komputer (Linux
 
 ## Fitur
 
-- **Rekam aktivitas**: lari, sepeda, jalan, hiking, renang, latihan. Di HP memakai GPS, di komputer berupa stopwatch.
+- **Rekam aktivitas**: lari, sepeda, jalan, hiking, renang, latihan. Di HP memakai GPS dan tetap jalan saat layar mati, di komputer berupa stopwatch.
+- **Saat merekam**: suara tiap kilometer (Bahasa Indonesia), jeda otomatis saat berhenti, hitung langkah, latihan interval dengan getar dan suara, layar fokus dengan angka besar dan "geser untuk selesai".
 - **Peta offline**: unduh peta per kecamatan atau kabupaten/kota (bisa beberapa wilayah sekaligus), lalu pakai tanpa internet. Bisa juga impor file `.pmtiles` sendiri.
-- **Statistik**: ringkasan mingguan, rekor pribadi, kalender latihan, split per km, zona detak jantung.
+- **Statistik**: ringkasan mingguan, ringkasan bulanan/tahunan, rekor pribadi, kalender latihan, split per km, grafik tempo, zona detak jantung.
+- **Rekor dan rute**: perayaan saat memecahkan rekor atau mencapai target, dan perbandingan waktu di rute yang sama.
+- **Bagikan**: kartu gambar berisi rute dan angka, untuk dikirim lewat app apa pun.
 - **Target dan perlengkapan**: target mingguan/bulanan, jarak tempuh sepatu dan sepeda.
 - **Rute**: buat rute sendiri, peta jejak semua aktivitas.
 - **Data milik Anda**: ekspor GPX dan CSV, cadangkan dan pulihkan dalam JSON.
@@ -16,7 +19,7 @@ Pencatat olahraga yang **pribadi dan offline** untuk Android dan komputer (Linux
 
 - Tidak perlu akun, email, nomor HP, atau tanggal lahir.
 - Internet **hanya** dipakai saat Anda menekan tombol unduh peta. Yang diminta hanyalah potongan peta untuk wilayah yang Anda pilih sendiri dari daftar; lokasi GPS, rute, dan aktivitas tidak pernah dikirim ke mana pun.
-- Izin Android yang dipakai: lokasi (untuk merekam rute) dan internet (untuk unduh peta).
+- Izin Android yang dipakai: lokasi (merekam rute), notifikasi dan layanan latar depan (rekam saat layar mati), aktivitas fisik (hitung langkah), getar (penanda interval), dan internet (unduh peta).
 
 ## Install di Android
 

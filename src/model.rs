@@ -35,17 +35,6 @@ impl Sport {
         }
     }
 
-    pub fn letter(self) -> &'static str {
-        match self {
-            Sport::Run => "L",
-            Sport::Ride => "S",
-            Sport::Walk => "J",
-            Sport::Hike => "H",
-            Sport::Swim => "R",
-            Sport::Workout => "W",
-        }
-    }
-
     /// Rough MET value for calorie estimates.
     pub fn met(self) -> f64 {
         match self {
@@ -65,6 +54,19 @@ impl Sport {
 
     pub fn has_distance(self) -> bool {
         !matches!(self, Sport::Workout)
+    }
+
+    /// Below this speed (m/s) the recording counts as standing still, for auto-pause.
+    pub fn min_moving_speed(self) -> f64 {
+        match self {
+            Sport::Ride => 1.5,
+            _ => 0.6,
+        }
+    }
+
+    /// Sports where a phone's step counter means something.
+    pub fn has_steps(self) -> bool {
+        matches!(self, Sport::Run | Sport::Walk | Sport::Hike)
     }
 }
 
@@ -98,6 +100,9 @@ pub struct Activity {
     /// Lap split times in seconds since start.
     #[serde(default)]
     pub laps: Vec<f64>,
+    /// Steps counted by the phone while recording.
+    #[serde(default)]
+    pub steps: Option<u32>,
 }
 
 impl Activity {
@@ -114,6 +119,43 @@ impl Activity {
             .timestamp_opt(self.start, 0)
             .single()
             .unwrap_or_else(Local::now)
+    }
+
+    /// Steps per minute of moving time.
+    pub fn cadence(&self) -> Option<f64> {
+        let steps = self.steps.filter(|s| *s > 0)?;
+        (self.duration_s > 60.0).then(|| steps as f64 / (self.duration_s / 60.0))
+    }
+
+    /// Pace (or speed) along the track: (distance m, metres per second), smoothed over ~200 m.
+    pub fn speed_profile(&self) -> Vec<[f64; 2]> {
+        let pts = &self.track;
+        if pts.len() < 3 || pts[0].t.is_none() {
+            return Vec::new();
+        }
+        let mut cum = vec![0.0];
+        for w in pts.windows(2) {
+            cum.push(cum.last().unwrap() + haversine(&w[0], &w[1]));
+        }
+        let mut out = Vec::new();
+        let mut j = 0;
+        let step = (cum.last().unwrap() / 120.0).max(25.0);
+        let mut next = 0.0;
+        for i in 0..pts.len() {
+            if cum[i] < next {
+                continue;
+            }
+            next = cum[i] + step;
+            while j < pts.len() - 1 && cum[j] - cum[i] < 200.0 {
+                j += 1;
+            }
+            let dt = pts[j].t.unwrap_or(0.0) - pts[i].t.unwrap_or(0.0);
+            let dd = cum[j] - cum[i];
+            if dt > 0.0 && dd > 50.0 {
+                out.push([cum[i], dd / dt]);
+            }
+        }
+        out
     }
 
     pub fn calories(&self, weight_kg: f32) -> f64 {
@@ -263,7 +305,47 @@ impl Route {
     }
 }
 
+/// Run/rest blocks, e.g. 1 minute running and 1 minute walking, 8 times.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub struct Interval {
+    pub on: bool,
+    pub work_s: u32,
+    pub rest_s: u32,
+    pub reps: u32,
+}
+
+impl Default for Interval {
+    fn default() -> Self {
+        Self { on: false, work_s: 60, rest_s: 60, reps: 8 }
+    }
+}
+
+/// Where a recording is within an interval workout.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Phase {
+    Work { rep: u32, left_s: f64 },
+    Rest { rep: u32, left_s: f64 },
+    Done,
+}
+
+impl Interval {
+    pub fn phase(&self, t: f64) -> Phase {
+        let cycle = (self.work_s + self.rest_s).max(1) as f64;
+        let rep = (t / cycle).floor() as u32;
+        if rep >= self.reps {
+            return Phase::Done;
+        }
+        let into = t - rep as f64 * cycle;
+        if into < self.work_s as f64 {
+            Phase::Work { rep: rep + 1, left_s: self.work_s as f64 - into }
+        } else {
+            Phase::Rest { rep: rep + 1, left_s: cycle - into }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct Settings {
     /// Optional, never required.
     pub nickname: String,
@@ -271,6 +353,13 @@ pub struct Settings {
     pub dark: bool,
     pub max_hr: u32,
     pub weight_kg: f32,
+    /// Spoken distance and pace every kilometre (phones).
+    pub voice: bool,
+    /// Stop the clock while standing still.
+    pub auto_pause: bool,
+    pub interval: Interval,
+    /// False until the welcome screens were seen; existing data counts as seen.
+    pub onboarded: bool,
 }
 
 impl Default for Settings {
@@ -281,6 +370,10 @@ impl Default for Settings {
             dark: true,
             max_hr: 190,
             weight_kg: 65.0,
+            voice: true,
+            auto_pause: true,
+            interval: Interval::default(),
+            onboarded: true,
         }
     }
 }
@@ -318,16 +411,23 @@ impl Data {
     }
 
     pub fn in_period(&self, period: Period, sport: Option<Sport>) -> impl Iterator<Item = &Activity> {
-        let now = Local::now();
-        let today = now.date_naive();
-        let from = match period {
-            Period::Week => today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64),
-            Period::Month => today.with_day(1).unwrap_or(today),
-            Period::Year => today.with_ordinal(1).unwrap_or(today),
-        };
+        let from = period_start(period);
         self.activities.iter().filter(move |a| {
             a.date().date_naive() >= from && sport.is_none_or(|s| s == a.sport)
         })
+    }
+
+    /// How much `a` adds to a goal (0 when it is outside the goal's period or sport).
+    pub fn goal_share(g: &Goal, a: &Activity) -> f64 {
+        if a.date().date_naive() < period_start(g.period) || g.sport.is_some_and(|s| s != a.sport) {
+            return 0.0;
+        }
+        match g.metric {
+            Metric::Distance => a.distance_m / 1000.0,
+            Metric::Time => a.duration_s / 3600.0,
+            Metric::Count => 1.0,
+            Metric::Elevation => a.elev_gain_m,
+        }
     }
 
     pub fn goal_progress(&self, g: &Goal) -> f64 {
@@ -338,6 +438,17 @@ impl Data {
             Metric::Count => it.count() as f64,
             Metric::Elevation => it.map(|a| a.elev_gain_m).sum::<f64>(),
         }
+    }
+
+    /// Earlier activities of the same sport over the same route as `a`, oldest first.
+    pub fn same_route(&self, a: &Activity) -> Vec<&Activity> {
+        let mut v: Vec<&Activity> = self
+            .activities
+            .iter()
+            .filter(|b| b.id != a.id && b.sport == a.sport && same_route(a, b))
+            .collect();
+        v.sort_by_key(|b| b.start);
+        v
     }
 
     /// Consecutive days (ending today or yesterday) with at least one activity.
@@ -378,6 +489,16 @@ impl Data {
     }
 }
 
+/// First day of the current week (Monday), month or year.
+pub fn period_start(period: Period) -> chrono::NaiveDate {
+    let today = Local::now().date_naive();
+    match period {
+        Period::Week => today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64),
+        Period::Month => today.with_day(1).unwrap_or(today),
+        Period::Year => today.with_ordinal(1).unwrap_or(today),
+    }
+}
+
 pub fn haversine(a: &TrackPoint, b: &TrackPoint) -> f64 {
     let r = 6_371_000.0;
     let (la1, la2) = (a.lat.to_radians(), b.lat.to_radians());
@@ -385,6 +506,40 @@ pub fn haversine(a: &TrackPoint, b: &TrackPoint) -> f64 {
     let dlo = (b.lon - a.lon).to_radians();
     let h = (dla / 2.0).sin().powi(2) + la1.cos() * la2.cos() * (dlo / 2.0).sin().powi(2);
     2.0 * r * h.sqrt().asin()
+}
+
+/// Seconds spent standing still: track pieces slower than `min_speed`, or long gaps without movement.
+pub fn stopped_time(track: &[TrackPoint], min_speed: f64) -> f64 {
+    let mut stopped = 0.0;
+    for w in track.windows(2) {
+        let (Some(t0), Some(t1)) = (w[0].t, w[1].t) else { continue };
+        let dt = t1 - t0;
+        if dt > 0.0 && haversine(&w[0], &w[1]) / dt < min_speed {
+            stopped += dt;
+        }
+    }
+    stopped
+}
+
+/// True when two tracks follow the same route: similar length, same start and end, same path.
+pub fn same_route(a: &Activity, b: &Activity) -> bool {
+    let (ta, tb) = (&a.track, &b.track);
+    if ta.len() < 10 || tb.len() < 10 || a.distance_m < 300.0 {
+        return false;
+    }
+    if (a.distance_m - b.distance_m).abs() > 0.15 * a.distance_m.max(b.distance_m) {
+        return false;
+    }
+    let near = |p: &TrackPoint, q: &TrackPoint, m: f64| haversine(p, q) <= m;
+    if !near(&ta[0], &tb[0], 150.0) || !near(ta.last().unwrap(), tb.last().unwrap(), 150.0) {
+        return false;
+    }
+    let step_b = (tb.len() / 400).max(1);
+    let samples = 12;
+    (0..samples).all(|i| {
+        let p = &ta[i * (ta.len() - 1) / (samples - 1)];
+        tb.iter().step_by(step_b).any(|q| near(p, q, 100.0))
+    })
 }
 
 pub fn track_stats(track: &[TrackPoint]) -> (f64, f64, f64) {
@@ -560,6 +715,8 @@ pub fn sample_data() -> Data {
             track,
             favorite: i == 12,
             laps: Vec::new(),
+            steps: matches!(sport, Sport::Run | Sport::Walk | Sport::Hike)
+                .then(|| (dur / 60.0 * if sport == Sport::Run { 168.0 } else { 112.0 }) as u32),
         });
     }
     let g1 = d.new_id();
@@ -594,4 +751,55 @@ pub fn sample_data() -> Data {
     });
     d.sort();
     d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loop_activity(id: u64, shift_m: f64, scale: f64) -> Activity {
+        let track: Vec<TrackPoint> = (0..=100)
+            .map(|i| {
+                let a = i as f64 / 100.0 * std::f64::consts::TAU;
+                let (x, y) = (800.0 * scale * a.cos() + shift_m, 500.0 * scale * a.sin());
+                TrackPoint { lat: -6.2 + y / 111_320.0, lon: 107.0 + x / 110_700.0, ele: None, t: Some(i as f64 * 10.0) }
+            })
+            .collect();
+        let (distance_m, _, duration_s) = track_stats(&track);
+        Activity {
+            id,
+            sport: Sport::Run,
+            title: String::new(),
+            start: id as i64,
+            duration_s,
+            distance_m,
+            elev_gain_m: 0.0,
+            avg_hr: None,
+            effort: 5,
+            notes: String::new(),
+            gear: None,
+            track,
+            favorite: false,
+            laps: Vec::new(),
+            steps: None,
+        }
+    }
+
+    #[test]
+    fn the_same_loop_is_the_same_route() {
+        let a = loop_activity(1, 0.0, 1.0);
+        assert!(same_route(&a, &loop_activity(2, 30.0, 1.0)), "a few metres of GPS drift");
+        assert!(!same_route(&a, &loop_activity(3, 0.0, 1.6)), "a bigger loop");
+        assert!(!same_route(&a, &loop_activity(4, 2000.0, 1.0)), "somewhere else");
+    }
+
+    #[test]
+    fn goal_share_counts_only_matching_activities() {
+        let g = Goal { id: 1, sport: Some(Sport::Ride), period: Period::Week, metric: Metric::Count, target: 3.0 };
+        let mut a = loop_activity(1, 0.0, 1.0);
+        a.start = Local::now().timestamp();
+        assert_eq!(Data::goal_share(&g, &a), 0.0);
+        a.sport = Sport::Ride;
+        assert_eq!(Data::goal_share(&g, &a), 1.0);
+    }
 }

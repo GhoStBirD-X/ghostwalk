@@ -30,25 +30,50 @@ public class Gps implements LocationListener {
     private static volatile long lastFix;
     private static final ArrayList<double[]> fixes = new ArrayList<>();
 
-    /** Asks for location permission if needed, then starts receiving positions about once a second. */
+    /**
+     * Asks for everything a recording uses that is not allowed yet: location (Android 12+ ignores
+     * precise without approximate), the "recording" notification (13+) and the step counter (10+).
+     */
+    public static void ask(final Activity activity) {
+        final ArrayList<String> wanted = new ArrayList<>();
+        String[] all = {
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Build.VERSION.SDK_INT >= 33 ? "android.permission.POST_NOTIFICATIONS" : null,
+            Build.VERSION.SDK_INT >= 29 ? "android.permission.ACTIVITY_RECOGNITION" : null,
+        };
+        for (String p : all) {
+            if (p != null && activity.checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) {
+                wanted.add(p);
+            }
+        }
+        if (wanted.isEmpty()) {
+            return;
+        }
+        MAIN.post(new Runnable() {
+            public void run() {
+                try {
+                    activity.requestPermissions(wanted.toArray(new String[0]), 7);
+                } catch (Exception e) {
+                    // Leave the recording running without GPS.
+                }
+            }
+        });
+    }
+
+    /** Asks for permission if needed, then starts receiving positions about once a second, also in the background. */
     public static void start(final Activity activity) {
         if (activity.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            // Android 12+ ignores a request for precise location unless approximate is asked for too.
-            final String[] wanted = {Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION};
-            MAIN.post(new Runnable() {
-                public void run() {
-                    try {
-                        activity.requestPermissions(wanted, 7);
-                    } catch (Exception e) {
-                        // Leave the recording running without GPS.
-                    }
-                }
-            });
+            ask(activity);
             return;
         }
         if (running) {
             return;
         }
+        // Keeps the recording alive with the screen off or another app open.
+        Tracker.start(activity);
+        // Location is allowed; also ask for the notification and step counter if they are still missing.
+        ask(activity);
         Log.i(TAG, "gps permission ok, asking for updates");
         running = true;
         manager = (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
@@ -72,6 +97,8 @@ public class Gps implements LocationListener {
 
     public static void stop(final Activity activity) {
         running = false;
+        Tracker.stop(activity);
+        Coach.end();
         MAIN.post(new Runnable() {
             public void run() {
                 try {
@@ -158,6 +185,7 @@ public class Gps implements LocationListener {
             Log.i(TAG, "gps first fix, accuracy " + l.getAccuracy() + " m");
         }
         lastFix = System.currentTimeMillis();
+        Coach.onFix(l);
         synchronized (fixes) {
             fixes.add(new double[] {l.getLatitude(), l.getLongitude(), l.getAltitude(), l.getAccuracy(), (double) l.getTime()});
         }

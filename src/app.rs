@@ -3,6 +3,7 @@
 use crate::draw::{self, ACCENT, Icon};
 use crate::gpx;
 use crate::model::{self, Activity, Data, Sport};
+use crate::record::{RecState, Recorder};
 use chrono::{Datelike, Local, NaiveDateTime, TimeZone, Timelike};
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke, Ui, pos2, vec2};
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ pub enum Tab {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Sub {
+    Summary,
     Stats,
     Records,
     Calendar,
@@ -144,7 +146,7 @@ pub fn parse_time(s: &str) -> Option<f64> {
     })
 }
 
-fn default_title(sport: Sport, start: i64) -> String {
+pub fn default_title(sport: Sport, start: i64) -> String {
     let h = Local
         .timestamp_opt(start, 0)
         .single()
@@ -157,61 +159,6 @@ fn default_title(sport: Sport, start: i64) -> String {
         _ => "malam",
     };
     format!("{} {}", sport.name(), part)
-}
-
-pub enum RecState {
-    Idle,
-    Running { since: Instant, before: f64 },
-    Paused { total: f64 },
-    Done { total: f64 },
-}
-
-pub struct Recorder {
-    pub sport: Sport,
-    pub state: RecState,
-    pub laps: Vec<f64>,
-    pub form: Form,
-    /// Positions from the phone's GPS (empty on computers).
-    pub track: Vec<model::TrackPoint>,
-    /// 0 = no permission, 1 = waiting for signal, 2 = receiving, 3 = Location off; -1 = no GPS on this device.
-    pub gps: i32,
-    /// When the app last asked the phone to start GPS.
-    pub gps_asked: Option<Instant>,
-}
-
-impl Recorder {
-    pub fn distance(&self) -> f64 {
-        model::track_stats(&self.track).0
-    }
-
-    /// Reads new GPS positions (phones only) and keeps the good ones while recording.
-    fn poll_gps(&mut self) {
-        #[cfg(target_os = "android")]
-        {
-            let running = matches!(self.state, RecState::Running { .. });
-            if running && self.gps != 2 {
-                if self.gps_asked.is_none_or(|t| t.elapsed().as_secs() >= 3) {
-                    self.gps_asked = Some(Instant::now());
-                    crate::android::gps_start();
-                }
-                self.gps = crate::android::gps_state();
-            }
-            let t = self.elapsed();
-            for [lat, lon, ele, acc, _ms] in crate::android::gps_drain() {
-                if running && acc <= 35.0 {
-                    self.track.push(model::TrackPoint { lat, lon, ele: Some(ele), t: Some(t) });
-                }
-            }
-        }
-    }
-
-    pub fn elapsed(&self) -> f64 {
-        match self.state {
-            RecState::Idle => 0.0,
-            RecState::Running { since, before } => before + since.elapsed().as_secs_f64(),
-            RecState::Paused { total } | RecState::Done { total } => total,
-        }
-    }
 }
 
 struct Shot {
@@ -252,6 +199,14 @@ pub struct GhostApp {
     pub map_delete: Option<PathBuf>,
     /// Shown once after the app closed by itself.
     pub crash_report: Option<String>,
+    /// A card with confetti for records set by the activity just saved.
+    pub celebrate: Option<(Vec<String>, Instant)>,
+    /// The last deleted activity, while it can still be brought back.
+    pub undo: Option<(Activity, Instant)>,
+    pub onboard_step: u8,
+    pub share: Option<crate::moments::ShareCard>,
+    pub summary_year: bool,
+    pub summary_offset: i32,
     /// Waiting for the phone's file picker.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub picking: Option<Pick>,
@@ -271,7 +226,8 @@ impl GhostApp {
         let persist = screenshot.is_none();
         let data = if persist {
             model::load().unwrap_or_else(|| {
-                let d = model::sample_data();
+                let mut d = Data::default();
+                d.settings.onboarded = false;
                 let _ = model::save(&d);
                 d
             })
@@ -287,15 +243,7 @@ impl GhostApp {
             detail: None,
             edit: None,
             sub: None,
-            rec: Recorder {
-                sport: Sport::Run,
-                state: RecState::Idle,
-                laps: Vec::new(),
-                form: Form::blank(Sport::Run),
-                track: Vec::new(),
-                gps: if cfg!(target_os = "android") { 1 } else { -1 },
-                gps_asked: None,
-            },
+            rec: Recorder::new(Sport::Run),
             manual: Form::blank(Sport::Run),
             show_manual: false,
             import_path: String::new(),
@@ -326,6 +274,12 @@ impl GhostApp {
             map_delete: None,
             crash_report: if persist { std::fs::read_to_string(model::crash_file()).ok() } else { None },
             picking: None,
+            celebrate: None,
+            undo: None,
+            onboard_step: 0,
+            share: None,
+            summary_year: false,
+            summary_offset: 0,
             insets: [0.0; 5],
             insets_at: None,
             applied_dark: None,
@@ -355,6 +309,25 @@ impl GhostApp {
             "gear" => (self.tab, self.sub) = (Tab::You, Some(Sub::Gear)),
             "tools" => (self.tab, self.sub) = (Tab::You, Some(Sub::Tools)),
             "settings" => (self.tab, self.sub) = (Tab::You, Some(Sub::Settings)),
+            "summary" => (self.tab, self.sub) = (Tab::You, Some(Sub::Summary)),
+            "onboarding" => self.data.settings.onboarded = false,
+            "share" => self.share = self.data.activities.first().map(|a| crate::moments::ShareCard::new(a.id)),
+            "celebrate" => {
+                self.celebrate = Some((vec!["Rekor 5K baru: 24:31".into(), "Tercepat di rute ini, 0:42 lebih cepat".into()], Instant::now()))
+            }
+            "recording" => {
+                // A recording in progress, with a finished track standing in for live GPS.
+                self.tab = Tab::Record;
+                let settings = self.data.settings.clone();
+                self.rec.begin(&settings);
+                self.rec.gps = 2;
+                self.rec.steps = 4210;
+                if let Some(a) = self.data.activities.iter().find(|a| a.sport == Sport::Run && a.track.len() > 1) {
+                    self.rec.track = a.track.clone();
+                    let since_ms = chrono::Utc::now().timestamp_millis() - (a.duration_s * 1000.0) as i64;
+                    self.rec.state = RecState::Running { since_ms, before: 0.0 };
+                }
+            }
             "detail" => self.detail = self.data.activities.first().map(|a| a.id),
             _ => {}
         }
@@ -437,6 +410,8 @@ impl eframe::App for GhostApp {
             self.insets = fresh;
         }
         let [_, top, _, bottom, keyboard] = self.insets;
+        // GPS and steps keep coming in whichever page is open.
+        self.rec.poll();
         #[cfg(target_os = "android")]
         if let Some(kind) = self.picking {
             ctx.request_repaint();
@@ -461,6 +436,14 @@ impl eframe::App for GhostApp {
         if keyboard > 0.0 {
             egui::Panel::bottom("keyboard")
                 .exact_size(keyboard)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(draw::bg(ui)))
+                .show(ui, |_| {});
+        } else if !self.data.settings.onboarded || self.recording_screen() {
+            // No tabs on the welcome screens or while recording (so a pocket tap can't leave the page).
+            egui::Panel::bottom("system_bar")
+                .exact_size(bottom.max(8.0))
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(egui::Frame::new().fill(draw::bg(ui)))
@@ -498,6 +481,9 @@ impl eframe::App for GhostApp {
                     });
             });
 
+        self.celebration(&ctx);
+        self.share_overlay(&ctx);
+        self.undo_toast(&ctx, bottom + keyboard);
         if let Some((msg, left)) = &mut self.toast {
             *left -= ctx.input(|i| i.stable_dt).min(0.1) as f64;
             let msg = msg.clone();
@@ -538,9 +524,16 @@ impl eframe::App for GhostApp {
 }
 
 impl GhostApp {
+    /// True while the Record page shows a recording in progress.
+    fn recording_screen(&self) -> bool {
+        self.tab == Tab::Record && self.rec.active() && self.detail.is_none() && self.sub.is_none()
+    }
+
     fn page(&mut self, ui: &mut Ui) {
         ui.add_space(10.0);
-        if let Some(id) = self.detail {
+        if !self.data.settings.onboarded {
+            self.onboarding(ui);
+        } else if let Some(id) = self.detail {
             self.activity_page(ui, id);
         } else if let Some(sub) = self.sub {
             self.sub_page(ui, sub);
@@ -620,9 +613,18 @@ impl GhostApp {
             draw::ghost(ui.painter(), r.center(), 28.0, ACCENT, draw::bg(ui));
             ui.label(draw::big(title, 26.0, draw::strong(ui)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                draw::pill(ui, "Offline", draw::lime(ui), true).on_hover_text(
-                    "Tidak ada akun. Internet hanya dipakai saat Anda mengunduh peta. Semua data hanya ada di perangkat ini.",
-                );
+                if self.rec.active() {
+                    let text = format!("Merekam {}", draw::clock(self.rec.moving()));
+                    if draw::pill(ui, &text, ACCENT, true).interact(Sense::click()).clicked() {
+                        self.tab = Tab::Record;
+                        self.detail = None;
+                        self.sub = None;
+                    }
+                } else {
+                    draw::pill(ui, "Offline", draw::lime(ui), true).on_hover_text(
+                        "Tidak ada akun. Internet hanya dipakai saat Anda mengunduh peta. Semua data hanya ada di perangkat ini.",
+                    );
+                }
             });
         });
         ui.add_space(10.0);
@@ -771,9 +773,14 @@ impl GhostApp {
         if self.data.activities.is_empty() {
             draw::card(ui, |ui| {
                 ui.label("Belum ada aktivitas. Tekan Rekam untuk mulai, atau impor file GPX.");
-                if draw::accent_button(ui, "Mulai rekam").clicked() {
-                    self.tab = Tab::Record;
-                }
+                ui.horizontal_wrapped(|ui| {
+                    if draw::accent_button(ui, "Mulai rekam").clicked() {
+                        self.tab = Tab::Record;
+                    }
+                    if ui.button("Isi data contoh").clicked() {
+                        self.load_samples();
+                    }
+                });
             });
         }
 
@@ -895,24 +902,29 @@ impl GhostApp {
             return;
         }
 
-        ui.horizontal(|ui| {
-            draw::sport_badge(ui, a.sport, 40.0);
-            ui.vertical(|ui| {
-                ui.label(RichText::new(&a.title).size(20.0).family(draw::semi()).color(draw::strong(ui)));
-                ui.label(
-                    RichText::new(format!("{} · {}", draw::date_long(&a.date()), a.sport.name()))
-                        .size(12.0)
-                        .color(draw::muted(ui)),
-                );
-            });
-        });
-        ui.add_space(6.0);
         if a.track.len() > 1 {
             let around = draw::bg(ui);
-            draw::route_map(ui, &a.track, draw::sport_color(a.sport), 280.0, true, around);
-            ui.add_space(8.0);
+            draw::route_map(ui, &a.track, draw::sport_color(a.sport), 330.0, true, around);
+            ui.add_space(-26.0);
         }
         draw::card(ui, |ui| {
+            // A handle, so the card reads as a sheet lying on the map.
+            let (h, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+            ui.painter().rect_filled(egui::Rect::from_center_size(h.center(), vec2(40.0, 5.0)), 3.0, draw::border(ui));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                draw::sport_badge(ui, a.sport, 44.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.label(RichText::new(&a.title).size(21.0).family(draw::heavy()).color(draw::strong(ui)));
+                    ui.label(
+                        RichText::new(format!("{} · {}", draw::date_long(&a.date()), a.sport.name()))
+                            .size(12.5)
+                            .color(draw::muted(ui)),
+                    );
+                });
+            });
+            ui.add_space(10.0);
             let mut items: Vec<(&str, String)> = Vec::new();
             if a.sport.has_distance() {
                 items.push(("Jarak", draw::dist(a.distance_m, imp)));
@@ -930,6 +942,12 @@ impl GhostApp {
                 let zone = hr_zone(hr, self.data.settings.max_hr);
                 items.push(("Zona", format!("Z{zone}")));
             }
+            if let Some(steps) = a.steps.filter(|s| *s > 0) {
+                items.push(("Langkah", steps.to_string()));
+            }
+            if let Some(c) = a.cadence() {
+                items.push(("Langkah/menit", format!("{c:.0}")));
+            }
             if let Some(g) = a.gear.and_then(|g| self.data.gear.iter().find(|x| x.id == g)) {
                 items.push(("Perlengkapan", g.name.clone()));
             }
@@ -939,6 +957,49 @@ impl GhostApp {
                 ui.label(&a.notes);
             }
         });
+
+        // How this one compares with earlier times on the same route.
+        let route = self.data.same_route(&a);
+        if !route.is_empty() {
+            ui.add_space(8.0);
+            draw::card(ui, |ui| {
+                draw::heading(ui, "Rute ini");
+                let best = route.iter().map(|b| b.duration_s).fold(a.duration_s, f64::min);
+                let n = route.len() + 1;
+                ui.label(RichText::new(format!("Sudah {n} kali lewat rute ini.")).size(13.5).color(draw::muted(ui)));
+                if a.duration_s <= best + 0.5 {
+                    draw::pill(ui, "Tercepat di rute ini", draw::lime(ui), true);
+                } else {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} lebih lambat dari waktu terbaik ({})",
+                            draw::clock(a.duration_s - best),
+                            draw::clock(best)
+                        ))
+                        .family(draw::semi())
+                        .color(draw::strong(ui)),
+                    );
+                }
+                let mut all: Vec<&Activity> = route.clone();
+                all.push(&a);
+                all.sort_by_key(|b| b.start);
+                let vals: Vec<f64> = all.iter().map(|b| b.duration_s / 60.0).collect();
+                let labels: Vec<String> = all.iter().map(|b| b.date().format("%d/%m").to_string()).collect();
+                draw::bars(ui, &vals, &labels, draw::sport_color(a.sport), 80.0, false);
+            });
+        }
+
+        let profile = a.speed_profile();
+        if profile.len() > 4 {
+            ui.add_space(8.0);
+            draw::card(ui, |ui| {
+                draw::heading(ui, if a.sport.uses_speed() { "Kecepatan" } else { "Tempo" });
+                let sport = a.sport;
+                draw::speed_chart(ui, &profile, draw::sport_color(a.sport), 130.0, move |v| {
+                    draw::pace_or_speed(sport, v, imp).1
+                });
+            });
+        }
 
         let splits = a.splits();
         if !splits.is_empty() {
@@ -983,7 +1044,10 @@ impl GhostApp {
 
         ui.add_space(10.0);
         ui.horizontal_wrapped(|ui| {
-            if draw::accent_button(ui, "Ubah").clicked() {
+            if draw::accent_button(ui, "Bagikan").clicked() {
+                self.share = Some(crate::moments::ShareCard::new(a.id));
+            }
+            if ui.button("Ubah").clicked() {
                 self.edit = Some(Form::from(&a));
             }
             if ui.button(if a.favorite { "Hapus favorit" } else { "Jadikan favorit" }).clicked() {
@@ -996,10 +1060,10 @@ impl GhostApp {
                 let name = format!("aktivitas-{}.gpx", a.date().format("%Y%m%d-%H%M"));
                 let path = self.export_dir().join(name);
                 let r = std::fs::create_dir_all(self.export_dir()).and_then(|_| std::fs::write(&path, gpx::write(&a)));
-                self.say(match r {
-                    Ok(()) => format!("Disimpan ke {}", path.display()),
-                    Err(e) => format!("Gagal: {e}"),
-                });
+                match r {
+                    Ok(()) => self.publish(&path, "application/gpx+xml", true),
+                    Err(e) => self.say(format!("Gagal: {e}")),
+                }
             }
             if a.track.len() > 1 && ui.button("Jadikan rute").clicked() {
                 let pts = draw::project(&a.track);
@@ -1017,12 +1081,21 @@ impl GhostApp {
                 self.say("Rute disimpan di Peta");
             }
             if ui.button(RichText::new("Hapus").color(draw::RED)).clicked() {
-                self.data.activities.retain(|x| x.id != id);
-                self.detail = None;
-                self.save();
-                self.say("Aktivitas dihapus");
+                self.delete_activity(id);
             }
         });
+    }
+
+    /// Tells where an exported file went; on phones it is first copied to Download/GhostWalk
+    /// (or the gallery for pictures), optionally opening the share sheet.
+    pub fn publish(&mut self, path: &std::path::Path, mime: &str, share: bool) {
+        #[cfg(target_os = "android")]
+        if let Some(place) = crate::android::publish(path, mime, share) {
+            self.say(format!("Disimpan di {place}"));
+            return;
+        }
+        let _ = (mime, share);
+        self.say(format!("Disimpan ke {}", path.display()));
     }
 
     pub fn export_dir(&self) -> PathBuf {
@@ -1093,268 +1166,6 @@ impl GhostApp {
         ui.add(egui::TextEdit::multiline(&mut f.notes).desired_rows(2).desired_width(w));
     }
 
-    // ---------- record ----------
-
-    fn record(&mut self, ui: &mut Ui) {
-        self.top_bar(ui, "Rekam");
-        self.rec.poll_gps();
-        let elapsed = self.rec.elapsed();
-        let imp = self.data.settings.imperial;
-        let idle = matches!(self.rec.state, RecState::Idle);
-        draw::card(ui, |ui| {
-            if idle {
-                ui.horizontal_wrapped(|ui| {
-                    for s in Sport::ALL {
-                        if draw::chip(ui, self.rec.sport == s, s.name()).clicked() {
-                            self.rec.sport = s;
-                        }
-                    }
-                });
-            } else {
-                ui.label(RichText::new(self.rec.sport.name()).size(14.0).family(draw::semi()).color(draw::sport_color(self.rec.sport)));
-            }
-            ui.add_space(8.0);
-            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 220.0), Sense::hover());
-            let p = ui.painter();
-            let c = r.center();
-            p.circle_filled(c, 100.0, ACCENT.gamma_multiply(0.06));
-            p.circle_stroke(c, 88.0, Stroke::new(8.0, draw::raised(ui)));
-            let frac = (elapsed % 60.0) / 60.0;
-            let n = 60;
-            let pts: Vec<_> = (0..=((n as f64 * frac) as usize))
-                .map(|i| {
-                    let a = -std::f32::consts::FRAC_PI_2 + i as f32 / n as f32 * std::f32::consts::TAU;
-                    pos2(c.x + 88.0 * a.cos(), c.y + 88.0 * a.sin())
-                })
-                .collect();
-            if pts.len() > 1 {
-                p.line(pts, Stroke::new(8.0, ACCENT));
-            }
-            p.text(c - vec2(0.0, 8.0), Align2::CENTER_CENTER, draw::clock(elapsed), FontId::new(54.0, draw::heavy()), draw::strong(ui));
-            let status = match self.rec.state {
-                RecState::Idle => "Siap",
-                RecState::Running { .. } => "Merekam…",
-                RecState::Paused { .. } => "Dijeda",
-                RecState::Done { .. } => "Selesai",
-            };
-            p.text(c + vec2(0.0, 34.0), Align2::CENTER_CENTER, status.to_uppercase(), FontId::new(13.0, draw::semi()), draw::muted(ui));
-            if !self.rec.laps.is_empty() {
-                p.text(
-                    c + vec2(0.0, 52.0),
-                    Align2::CENTER_CENTER,
-                    format!("Putaran {}", self.rec.laps.len() + 1),
-                    FontId::proportional(12.0),
-                    ACCENT,
-                );
-            }
-            if !idle && self.rec.gps >= 0 {
-                let d = self.rec.distance();
-                // GPS drifts a little even when standing still; wait for a real distance before showing pace.
-                let speed = if elapsed > 0.0 && d >= 50.0 { d / elapsed } else { 0.0 };
-                let (l, v) = draw::pace_or_speed(self.rec.sport, speed, imp);
-                draw::stat_grid(ui, &[("Jarak", draw::dist(d, imp)), (l, v)], 2);
-                let note = match self.rec.gps {
-                    0 => "Izin lokasi belum diberikan, jadi rute belum tercatat",
-                    1 => "Mencari sinyal GPS… (lebih cepat di luar ruangan)",
-                    3 => "Lokasi di HP sedang mati",
-                    _ => "GPS aktif",
-                };
-                let color = match self.rec.gps {
-                    2 => draw::GREEN,
-                    0 | 3 => ACCENT,
-                    _ => draw::muted(ui),
-                };
-                ui.label(RichText::new(note).size(12.5).color(color));
-                #[cfg(target_os = "android")]
-                ui.horizontal_wrapped(|ui| match self.rec.gps {
-                    0 => {
-                        if ui.button("Izinkan lokasi").clicked() {
-                            self.rec.gps_asked = None;
-                        }
-                        if ui.button("Buka pengaturan app").clicked() {
-                            crate::android::gps_open_app_settings();
-                        }
-                    }
-                    3 => {
-                        if ui.button("Nyalakan Lokasi").clicked() {
-                            crate::android::gps_open_location_settings();
-                        }
-                    }
-                    _ => {}
-                });
-                if self.rec.track.len() > 1 {
-                    let around = draw::card_bg(ui);
-                    draw::route_map(ui, &self.rec.track, draw::sport_color(self.rec.sport), 200.0, true, around);
-                }
-            }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let total = elapsed;
-                match self.rec.state {
-                    RecState::Idle => {
-                        if draw::accent_button(ui, "   Mulai   ").clicked() {
-                            self.rec.state = RecState::Running { since: Instant::now(), before: 0.0 };
-                            self.rec.laps.clear();
-                            self.rec.track.clear();
-                            self.rec.gps_asked = None;
-                        }
-                    }
-                    RecState::Running { .. } => {
-                        if draw::accent_button(ui, "Jeda").clicked() {
-                            self.rec.state = RecState::Paused { total };
-                        }
-                        if ui.button("Putaran").clicked() {
-                            self.rec.laps.push(total);
-                        }
-                        if ui.button("Selesai").clicked() {
-                            self.finish_recording(total);
-                        }
-                    }
-                    RecState::Paused { .. } => {
-                        if draw::accent_button(ui, "Lanjut").clicked() {
-                            self.rec.state = RecState::Running { since: Instant::now(), before: total };
-                        }
-                        if ui.button("Selesai").clicked() {
-                            self.finish_recording(total);
-                        }
-                        if ui.button(RichText::new("Buang").color(draw::RED)).clicked() {
-                            self.rec.state = RecState::Idle;
-                            self.rec.track.clear();
-                            #[cfg(target_os = "android")]
-                            crate::android::gps_stop();
-                        }
-                    }
-                    RecState::Done { .. } => {}
-                }
-            });
-            if idle && self.rec.gps < 0 {
-                ui.label(
-                    RichText::new("Di komputer tidak ada GPS: stopwatch mencatat waktu, jarak diisi saat selesai.")
-                        .size(11.5)
-                        .color(draw::muted(ui)),
-                );
-            }
-        });
-
-        if let RecState::Done { total } = self.rec.state {
-            ui.add_space(8.0);
-            let mut form = self.rec.form.clone();
-            let mut close = false;
-            draw::card(ui, |ui| {
-                draw::heading(ui, "Simpan aktivitas");
-                self.form_ui(ui, &mut form, false);
-                ui.horizontal(|ui| {
-                    if draw::accent_button(ui, "Simpan").clicked() {
-                        let start = Local::now().timestamp() - total as i64;
-                        let mut a = self.empty_activity(form.sport, start);
-                        a.duration_s = total;
-                        a.laps = self.rec.laps.clone();
-                        a.track = std::mem::take(&mut self.rec.track);
-                        let mut f = form.clone();
-                        f.time.clear();
-                        f.when = Local.timestamp_opt(start, 0).single().unwrap_or_else(Local::now).format("%Y-%m-%d %H:%M").to_string();
-                        match f.apply(&mut a) {
-                            Ok(()) => {
-                                let id = a.id;
-                                self.data.activities.push(a);
-                                self.save();
-                                self.say("Aktivitas tersimpan");
-                                self.detail = Some(id);
-                                self.tab = Tab::Home;
-                                close = true;
-                            }
-                            Err(e) => self.say(e),
-                        }
-                    }
-                    if ui.button(RichText::new("Buang").color(draw::RED)).clicked() {
-                        close = true;
-                    }
-                });
-            });
-            self.rec.form = form;
-            if close {
-                self.rec.state = RecState::Idle;
-                self.rec.laps.clear();
-            }
-            return;
-        }
-
-        // Manual entry.
-        ui.add_space(8.0);
-        draw::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Tambah manual").size(15.0).family(draw::semi()).color(draw::strong(ui)));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(if self.show_manual { "Tutup" } else { "Buka" }).clicked() {
-                        self.show_manual = !self.show_manual;
-                    }
-                });
-            });
-            ui.label(RichText::new("Untuk latihan di treadmill, gym atau yang lupa direkam.").size(11.5).color(draw::muted(ui)));
-            if self.show_manual {
-                let mut f = self.manual.clone();
-                self.form_ui(ui, &mut f, true);
-                if draw::accent_button(ui, "Tambah").clicked() {
-                    let mut a = self.empty_activity(f.sport, Local::now().timestamp());
-                    match f.apply(&mut a) {
-                        Ok(()) => {
-                            self.data.activities.push(a);
-                            self.save();
-                            self.say("Aktivitas ditambahkan");
-                            f = Form::blank(f.sport);
-                        }
-                        Err(e) => self.say(e),
-                    }
-                }
-                self.manual = f;
-            }
-        });
-
-        // GPX import.
-        ui.add_space(8.0);
-        draw::card(ui, |ui| {
-            ui.label(RichText::new("Impor file GPX").size(15.0).family(draw::semi()).color(draw::strong(ui)));
-            if cfg!(target_os = "android") {
-                ui.label(
-                    RichText::new("Dari jam olahraga atau app lain. Pilih file .gpx dari Download, Drive, atau WhatsApp.")
-                        .size(11.5)
-                        .color(draw::muted(ui)),
-                );
-                self.pick_button(ui, Pick::Gpx, "Pilih file GPX");
-            } else {
-                ui.label(
-                    RichText::new("Dari jam olahraga atau HP. Tulis lokasi file, atau tarik file ke jendela ini.")
-                        .size(11.5)
-                        .color(draw::muted(ui)),
-                );
-                ui.add(egui::TextEdit::singleline(&mut self.import_path).hint_text("/home/anda/Unduhan/lari.gpx").desired_width(f32::INFINITY));
-                if draw::accent_button(ui, "Impor").clicked() {
-                    let p = PathBuf::from(self.import_path.trim());
-                    self.import_gpx(&p);
-                }
-            }
-        });
-        let dropped: Vec<PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
-        for p in dropped {
-            self.import_gpx(&p);
-        }
-    }
-
-    fn finish_recording(&mut self, total: f64) {
-        self.rec.state = RecState::Done { total };
-        #[cfg(target_os = "android")]
-        crate::android::gps_stop();
-        let mut f = Form::blank(self.rec.sport);
-        if self.rec.track.len() > 1 {
-            let (d, gain, _) = model::track_stats(&self.rec.track);
-            f.dist_km = format!("{:.2}", d / 1000.0);
-            f.elev = format!("{gain:.0}");
-        }
-        f.title = default_title(self.rec.sport, Local::now().timestamp());
-        f.gear = self.data.gear.iter().find(|g| g.sport == self.rec.sport && !g.retired).map(|g| g.id);
-        self.rec.form = f;
-    }
-
     pub fn empty_activity(&mut self, sport: Sport, start: i64) -> Activity {
         Activity {
             id: self.data.new_id(),
@@ -1371,6 +1182,17 @@ impl GhostApp {
             track: Vec::new(),
             favorite: false,
             laps: Vec::new(),
+            steps: None,
+        }
+    }
+
+    /// Adds a new activity, saves, and celebrates any record it sets.
+    pub fn add_activity(&mut self, a: Activity) {
+        let wins = self.wins(&a);
+        self.data.activities.push(a);
+        self.save();
+        if !wins.is_empty() {
+            self.celebrate = Some((wins, Instant::now()));
         }
     }
 
@@ -1428,8 +1250,7 @@ impl GhostApp {
                 a.duration_s = if dur > 0.0 { dur } else { dist / 2.8 };
                 a.track = track;
                 let id = a.id;
-                self.data.activities.push(a);
-                self.save();
+                self.add_activity(a);
                 self.say("GPX berhasil diimpor");
                 self.detail = Some(id);
                 self.tab = Tab::Home;

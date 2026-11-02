@@ -432,6 +432,7 @@ impl GhostApp {
         ui.add_space(8.0);
 
         let items = [
+            (Sub::Summary, "Ringkasan", "Bulan dan tahun dalam angka, hari paling aktif"),
             (Sub::Stats, "Statistik", "Total per olahraga, per minggu dan per tahun"),
             (Sub::Records, "Rekor pribadi", "1K, 5K, 10K, setengah maraton, terjauh"),
             (Sub::Calendar, "Kalender latihan", "Lihat hari-hari Anda bergerak"),
@@ -482,6 +483,7 @@ impl GhostApp {
 
     pub fn sub_page(&mut self, ui: &mut Ui, sub: Sub) {
         let title = match sub {
+            Sub::Summary => "Ringkasan",
             Sub::Stats => "Statistik",
             Sub::Records => "Rekor pribadi",
             Sub::Calendar => "Kalender latihan",
@@ -495,6 +497,7 @@ impl GhostApp {
             return;
         }
         match sub {
+            Sub::Summary => self.summary(ui),
             Sub::Stats => self.stats(ui),
             Sub::Records => self.records(ui),
             Sub::Calendar => self.calendar(ui),
@@ -870,18 +873,18 @@ impl GhostApp {
                     let path = self.export_dir().join(format!("cadangan-{}.json", Local::now().format("%Y%m%d-%H%M")));
                     let r = std::fs::create_dir_all(self.export_dir())
                         .and_then(|_| std::fs::write(&path, serde_json::to_vec_pretty(&self.data).unwrap_or_default()));
-                    self.say(match r {
-                        Ok(()) => format!("Disimpan ke {}", path.display()),
-                        Err(e) => format!("Gagal: {e}"),
-                    });
+                    match r {
+                        Ok(()) => self.publish(&path, "application/json", false),
+                        Err(e) => self.say(format!("Gagal: {e}")),
+                    }
                 }
                 if ui.button("Ekspor tabel (CSV)").clicked() {
                     let path = self.export_dir().join("aktivitas.csv");
                     let r = std::fs::create_dir_all(self.export_dir()).and_then(|_| std::fs::write(&path, gpx::csv(&self.data.activities)));
-                    self.say(match r {
-                        Ok(()) => format!("Disimpan ke {}", path.display()),
-                        Err(e) => format!("Gagal: {e}"),
-                    });
+                    match r {
+                        Ok(()) => self.publish(&path, "text/csv", false),
+                        Err(e) => self.say(format!("Gagal: {e}")),
+                    }
                 }
             });
             ui.label(RichText::new("Pulihkan dari cadangan").size(12.0).color(draw::muted(ui)));

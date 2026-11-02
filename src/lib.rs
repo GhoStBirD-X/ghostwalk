@@ -5,10 +5,13 @@ mod draw;
 mod gpx;
 mod mapdl;
 mod model;
+mod moments;
 mod mvt;
 mod offmap;
 mod pmtiles;
+mod record;
 mod screens;
+mod summary;
 
 #[cfg(target_os = "android")]
 pub mod android;

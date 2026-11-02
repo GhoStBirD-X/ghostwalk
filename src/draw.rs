@@ -404,7 +404,165 @@ pub fn sport_badge(ui: &mut Ui, sport: Sport, size: f32) {
     let p = ui.painter();
     let c = sport_color(sport);
     p.rect_filled(rect, size * 0.3, c.gamma_multiply(0.18));
-    p.text(rect.center(), Align2::CENTER_CENTER, sport.letter(), FontId::new(size * 0.5, heavy()), c);
+    sport_icon(p, sport, rect.center(), size * 0.58, c);
+}
+
+fn ellipse(c: Pos2, rx: f32, ry: f32, tilt: f32) -> Vec<Pos2> {
+    (0..20)
+        .map(|i| {
+            let a = i as f32 / 20.0 * std::f32::consts::TAU;
+            let (x, y) = (rx * a.cos(), ry * a.sin());
+            c + vec2(x * tilt.cos() - y * tilt.sin(), x * tilt.sin() + y * tilt.cos())
+        })
+        .collect()
+}
+
+/// A small drawing for each sport (shoe, bicycle, footprints, mountain, waves, dumbbell), `s` wide.
+pub fn sport_icon(p: &egui::Painter, sport: Sport, c: Pos2, s: f32, color: Color32) {
+    let q = |x: f32, y: f32| c + vec2(x, y) * (s / 2.0);
+    let st = Stroke::new((s * 0.085).max(1.4), color);
+    let line = |pts: &[(f32, f32)]| {
+        p.line(pts.iter().map(|&(x, y)| q(x, y)).collect(), st);
+    };
+    match sport {
+        Sport::Run => {
+            line(&[
+                (-0.9, 0.45),
+                (0.72, 0.45),
+                (0.9, 0.3),
+                (0.84, 0.12),
+                (0.3, -0.02),
+                (0.02, -0.28),
+                (-0.28, -0.45),
+                (-0.58, -0.45),
+                (-0.62, -0.08),
+                (-0.9, 0.05),
+                (-0.9, 0.45),
+            ]);
+            line(&[(-0.9, 0.22), (0.86, 0.22)]);
+            line(&[(-0.12, -0.2), (0.1, -0.05)]);
+            line(&[(0.08, -0.32), (0.26, -0.18)]);
+        }
+        Sport::Ride => {
+            p.circle_stroke(q(-0.52, 0.32), s * 0.19, st);
+            p.circle_stroke(q(0.52, 0.32), s * 0.19, st);
+            line(&[(-0.52, 0.32), (-0.08, 0.32), (0.3, -0.22), (-0.24, -0.22), (-0.52, 0.32)]);
+            line(&[(-0.08, 0.32), (-0.3, -0.42)]);
+            line(&[(-0.42, -0.42), (-0.16, -0.42)]);
+            line(&[(0.52, 0.32), (0.32, -0.42), (0.52, -0.5)]);
+        }
+        Sport::Walk => {
+            for (x, y, t) in [(-0.32, 0.18, -0.2f32), (0.32, -0.22, 0.2f32)] {
+                p.add(egui::Shape::convex_polygon(ellipse(q(x, y), s * 0.15, s * 0.25, t), color, Stroke::NONE));
+                p.circle_filled(q(x + t * 0.5, y - 0.66), s * 0.07, color);
+            }
+        }
+        Sport::Hike => {
+            line(&[(-0.95, 0.6), (-0.3, -0.42), (0.05, 0.1), (0.35, -0.18), (0.95, 0.6), (-0.95, 0.6)]);
+            line(&[(-0.48, -0.14), (-0.3, -0.02), (-0.14, -0.16)]);
+            p.circle_filled(q(0.62, -0.58), s * 0.09, color);
+        }
+        Sport::Swim => {
+            for y in [-0.42f32, 0.02, 0.46] {
+                let pts: Vec<Pos2> = (0..=24)
+                    .map(|i| {
+                        let x = -0.92 + i as f32 / 24.0 * 1.84;
+                        q(x, y + 0.13 * (x * 6.0).sin())
+                    })
+                    .collect();
+                p.line(pts, st);
+            }
+        }
+        Sport::Workout => {
+            line(&[(-0.62, 0.0), (0.62, 0.0)]);
+            for (x, w, h) in [(-0.56f32, 0.2f32, 0.8f32), (0.56, 0.2, 0.8), (-0.82, 0.14, 0.5), (0.82, 0.14, 0.5)] {
+                p.rect_filled(egui::Rect::from_center_size(q(x, 0.0), vec2(w, h) * (s / 2.0)), s * 0.04, color);
+            }
+        }
+    }
+}
+
+/// A track with a knob that must be dragged to the end, so a pocket tap can't trigger it.
+pub fn slide_to_confirm(ui: &mut Ui, id_salt: &str, text: &str) -> bool {
+    let h = 60.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    let id = ui.scope_id().with(id_salt);
+    let max = rect.width() - h;
+    let mut off: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+    let knob = Rect::from_center_size(pos2(rect.left() + h / 2.0 + off, rect.center().y), Vec2::splat(h - 10.0));
+    let resp = ui.interact(knob.expand(6.0), id, Sense::drag());
+    if resp.dragged() {
+        off = (off + resp.drag_delta().x).clamp(0.0, max);
+    }
+    let done = resp.drag_stopped() && off >= max * 0.85;
+    if !resp.dragged() {
+        // Spring back unless finished.
+        off = if done { 0.0 } else { (off - 30.0).max(0.0) };
+        if off > 0.0 {
+            ui.ctx().request_repaint();
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(id, off));
+    let p = ui.painter();
+    p.rect_filled(rect, h / 2.0, raised(ui));
+    let filled = Rect::from_min_max(rect.min, pos2(rect.left() + h + off, rect.bottom()));
+    p.rect_filled(filled, h / 2.0, RED.gamma_multiply(0.25));
+    let fade = 1.0 - (off / max.max(1.0)).clamp(0.0, 1.0);
+    p.text(
+        rect.center() + vec2(h * 0.3, 0.0),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::new(15.0, semi()),
+        muted(ui).gamma_multiply(fade),
+    );
+    let kc = pos2(rect.left() + h / 2.0 + off, rect.center().y);
+    p.circle_filled(kc, h / 2.0 - 5.0, RED);
+    for dx in [-6.0, 2.0] {
+        p.line(
+            vec![kc + vec2(dx, -7.0), kc + vec2(dx + 6.0, 0.0), kc + vec2(dx, 7.0)],
+            Stroke::new(2.5, Color32::WHITE),
+        );
+    }
+    done
+}
+
+/// Speed along the route as a filled line that fades downwards; faster is higher.
+/// `label` turns a speed (m/s) into the text for the top and bottom marks.
+pub fn speed_chart(ui: &mut Ui, pts: &[[f64; 2]], color: Color32, height: f32, label: impl Fn(f64) -> String) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    if pts.len() < 2 {
+        return;
+    }
+    let p = ui.painter_at(rect);
+    let plot = Rect::from_min_max(rect.min + vec2(0.0, 16.0), rect.max - vec2(0.0, 16.0));
+    let x1 = pts.last().unwrap()[0].max(1.0);
+    let lo = pts.iter().map(|q| q[1]).fold(f64::MAX, f64::min);
+    let hi = pts.iter().map(|q| q[1]).fold(f64::MIN, f64::max).max(lo + 0.1);
+    let at = |q: &[f64; 2]| {
+        pos2(
+            plot.left() + (q[0] / x1) as f32 * plot.width(),
+            plot.bottom() - ((q[1] - lo) / (hi - lo)) as f32 * plot.height(),
+        )
+    };
+    let line: Vec<Pos2> = pts.iter().map(at).collect();
+    let mut mesh = egui::Mesh::default();
+    let top = color.gamma_multiply(0.45);
+    let clear = color.gamma_multiply(0.0);
+    for q in &line {
+        mesh.colored_vertex(*q, top);
+        mesh.colored_vertex(pos2(q.x, plot.bottom()), clear);
+    }
+    for i in 0..line.len().saturating_sub(1) as u32 {
+        let k = i * 2;
+        mesh.add_triangle(k, k + 1, k + 2);
+        mesh.add_triangle(k + 1, k + 3, k + 2);
+    }
+    p.add(mesh);
+    p.line(line, Stroke::new(2.2, color));
+    let font = FontId::new(11.0, semi());
+    p.text(rect.left_top(), Align2::LEFT_TOP, label(hi), font.clone(), muted(ui));
+    p.text(rect.left_bottom(), Align2::LEFT_BOTTOM, label(lo), font.clone(), muted(ui));
+    p.text(rect.right_bottom(), Align2::RIGHT_BOTTOM, format!("{:.1} km", x1 / 1000.0).replace('.', ","), font, muted(ui));
 }
 
 /// The little ghost used as the app's mark.

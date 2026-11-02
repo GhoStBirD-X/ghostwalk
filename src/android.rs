@@ -174,3 +174,68 @@ pub fn picked_file() -> Option<String> {
     })
     .flatten()
 }
+
+/// Asks for every permission a recording uses that is still missing (location, notification, steps).
+pub fn ask_permissions() {
+    with_gps(|env, cls, act| {
+        env.call_static_method(cls, "ask", "(Landroid/app/Activity;)V", &[JValue::Object(act)])?;
+        Ok(())
+    });
+}
+
+/// Starts the spoken updates, step counter and interval cues for a new recording.
+pub fn coach_begin(voice: bool, by_speed: bool, auto_pause: bool, min_speed: f64, interval: Option<(u32, u32, u32)>) {
+    let (work, rest, reps) = interval.unwrap_or((0, 0, 0));
+    with_class("id.ghostwalk.app.Coach", |env, cls, act| {
+        env.call_static_method(
+            cls,
+            "begin",
+            "(Landroid/app/Activity;ZZZDIII)V",
+            &[
+                JValue::Object(act),
+                JValue::Bool(voice.into()),
+                JValue::Bool(by_speed.into()),
+                JValue::Bool(auto_pause.into()),
+                JValue::Double(min_speed),
+                JValue::Int(work as i32),
+                JValue::Int(rest as i32),
+                JValue::Int(reps as i32),
+            ],
+        )?;
+        Ok(())
+    });
+}
+
+pub fn coach_pause(paused: bool) {
+    with_class("id.ghostwalk.app.Coach", |env, cls, _| {
+        env.call_static_method(cls, "setPaused", "(Z)V", &[JValue::Bool(paused.into())])?;
+        Ok(())
+    });
+}
+
+/// Steps since the recording started.
+pub fn steps() -> u32 {
+    with_class("id.ghostwalk.app.Coach", |env, cls, _| env.call_static_method(cls, "steps", "()I", &[])?.i())
+        .unwrap_or(0)
+        .max(0) as u32
+}
+
+/// Puts a file in the gallery (pictures) or Download/GhostWalk and optionally opens the share sheet.
+/// Returns where it went, or None.
+pub fn publish(path: &std::path::Path, mime: &str, share: bool) -> Option<String> {
+    with_class("id.ghostwalk.app.Share", |env, cls, act| {
+        let p = env.new_string(path.to_string_lossy())?;
+        let m = env.new_string(mime)?;
+        let out = env
+            .call_static_method(
+                cls,
+                "publish",
+                "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/String;",
+                &[JValue::Object(act), JValue::Object(&p), JValue::Object(&m), JValue::Bool(share.into())],
+            )?
+            .l()?;
+        let s: String = env.get_string(&out.into())?.into();
+        Ok(s)
+    })
+    .filter(|s| !s.is_empty())
+}
