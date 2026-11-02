@@ -29,6 +29,14 @@ pub enum Sub {
     Settings,
 }
 
+/// What a file chosen in the phone's file picker is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    Gpx,
+    Map,
+    Backup,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MapMode {
     Routes,
@@ -244,6 +252,9 @@ pub struct GhostApp {
     pub map_delete: Option<PathBuf>,
     /// Shown once after the app closed by itself.
     pub crash_report: Option<String>,
+    /// Waiting for the phone's file picker.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub picking: Option<Pick>,
     /// Room taken by the phone's bars and keyboard (left, top, right, bottom, keyboard), in points.
     insets: [f32; 5],
     /// When the app first asked the phone for `insets`.
@@ -314,6 +325,7 @@ impl GhostApp {
             map_import: String::new(),
             map_delete: None,
             crash_report: if persist { std::fs::read_to_string(model::crash_file()).ok() } else { None },
+            picking: None,
             insets: [0.0; 5],
             insets_at: None,
             applied_dark: None,
@@ -425,6 +437,16 @@ impl eframe::App for GhostApp {
             self.insets = fresh;
         }
         let [_, top, _, bottom, keyboard] = self.insets;
+        #[cfg(target_os = "android")]
+        if let Some(kind) = self.picking {
+            ctx.request_repaint();
+            if let Some(path) = crate::android::picked_file() {
+                self.picking = None;
+                if !path.is_empty() {
+                    self.open_picked(kind, &PathBuf::from(path));
+                }
+            }
+        }
         self.handle_screenshot(&ctx);
 
         if top > 0.0 {
@@ -1292,15 +1314,24 @@ impl GhostApp {
         ui.add_space(8.0);
         draw::card(ui, |ui| {
             ui.label(RichText::new("Impor file GPX").size(15.0).family(draw::semi()).color(draw::strong(ui)));
-            ui.label(
-                RichText::new("Dari jam olahraga atau HP. Tulis lokasi file, atau tarik file ke jendela ini.")
-                    .size(11.5)
-                    .color(draw::muted(ui)),
-            );
-            ui.add(egui::TextEdit::singleline(&mut self.import_path).hint_text("/home/anda/Unduhan/lari.gpx").desired_width(f32::INFINITY));
-            if draw::accent_button(ui, "Impor").clicked() {
-                let p = PathBuf::from(self.import_path.trim());
-                self.import_gpx(&p);
+            if cfg!(target_os = "android") {
+                ui.label(
+                    RichText::new("Dari jam olahraga atau app lain. Pilih file .gpx dari Download, Drive, atau WhatsApp.")
+                        .size(11.5)
+                        .color(draw::muted(ui)),
+                );
+                self.pick_button(ui, Pick::Gpx, "Pilih file GPX");
+            } else {
+                ui.label(
+                    RichText::new("Dari jam olahraga atau HP. Tulis lokasi file, atau tarik file ke jendela ini.")
+                        .size(11.5)
+                        .color(draw::muted(ui)),
+                );
+                ui.add(egui::TextEdit::singleline(&mut self.import_path).hint_text("/home/anda/Unduhan/lari.gpx").desired_width(f32::INFINITY));
+                if draw::accent_button(ui, "Impor").clicked() {
+                    let p = PathBuf::from(self.import_path.trim());
+                    self.import_gpx(&p);
+                }
             }
         });
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
@@ -1341,6 +1372,34 @@ impl GhostApp {
             favorite: false,
             laps: Vec::new(),
         }
+    }
+
+    /// A button that opens the phone's file picker (phones only).
+    pub fn pick_button(&mut self, ui: &mut Ui, kind: Pick, text: &str) {
+        if self.picking == Some(kind) {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Menunggu file…");
+            });
+        } else if draw::accent_button(ui, text).clicked() {
+            self.picking = Some(kind);
+            #[cfg(target_os = "android")]
+            crate::android::pick_file();
+        }
+    }
+
+    /// Handles a file from the phone's file picker, then removes the app's temporary copy.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    fn open_picked(&mut self, kind: Pick, path: &std::path::Path) {
+        match kind {
+            Pick::Gpx => self.import_gpx(path),
+            Pick::Backup => self.restore_backup(path),
+            Pick::Map => match crate::mapdl::import(&path.to_string_lossy()) {
+                Ok(name) => self.say(format!("Peta {name} dipasang")),
+                Err(e) => self.say(format!("Gagal mengimpor: {e}")),
+            },
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     pub fn import_gpx(&mut self, path: &std::path::Path) {

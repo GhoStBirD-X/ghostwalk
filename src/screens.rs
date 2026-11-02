@@ -1,6 +1,6 @@
 //! Maps, goals and the "You" section with its pages.
 
-use crate::app::{GhostApp, MapMode, Sub, Tab, hr_zone, parse_time};
+use crate::app::{GhostApp, MapMode, Pick, Sub, Tab, hr_zone, parse_time};
 use crate::draw::{self, ACCENT};
 use crate::gpx;
 use crate::mapdl::{self, Status};
@@ -885,18 +885,13 @@ impl GhostApp {
                 }
             });
             ui.label(RichText::new("Pulihkan dari cadangan").size(12.0).color(draw::muted(ui)));
-            ui.add(egui::TextEdit::singleline(&mut self.restore_path).hint_text("lokasi file cadangan .json").desired_width(f32::INFINITY));
-            if ui.button("Pulihkan").clicked() {
-                match std::fs::read_to_string(self.restore_path.trim())
-                    .map_err(|e| e.to_string())
-                    .and_then(|s| serde_json::from_str::<model::Data>(&s).map_err(|e| e.to_string()))
-                {
-                    Ok(d) => {
-                        self.data = d;
-                        self.save();
-                        self.say("Data dipulihkan");
-                    }
-                    Err(e) => self.say(format!("Gagal memulihkan: {e}")),
+            if cfg!(target_os = "android") {
+                self.pick_button(ui, Pick::Backup, "Pilih file cadangan");
+            } else {
+                ui.add(egui::TextEdit::singleline(&mut self.restore_path).hint_text("lokasi file cadangan .json").desired_width(f32::INFINITY));
+                if ui.button("Pulihkan").clicked() {
+                    let path = std::path::PathBuf::from(self.restore_path.trim());
+                    self.restore_backup(&path);
                 }
             }
             ui.separator();
@@ -932,6 +927,21 @@ impl GhostApp {
         let s = &self.data.settings;
         if s.nickname != before.nickname || s.imperial != before.imperial || s.dark != before.dark || s.weight_kg != before.weight_kg {
             self.save();
+        }
+    }
+
+    /// Replaces all data with a backup file made by "Cadangkan (JSON)".
+    pub fn restore_backup(&mut self, path: &std::path::Path) {
+        match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str::<model::Data>(&s).map_err(|e| e.to_string()))
+        {
+            Ok(d) => {
+                self.data = d;
+                self.save();
+                self.say("Data dipulihkan");
+            }
+            Err(e) => self.say(format!("Gagal memulihkan: {e}")),
         }
     }
 
@@ -1178,14 +1188,18 @@ impl GhostApp {
                 .size(11.5)
                 .color(draw::muted(ui)),
             );
-            ui.add(egui::TextEdit::singleline(&mut self.map_import).hint_text("lokasi file .pmtiles").desired_width(f32::INFINITY));
-            if ui.button("Impor").clicked() {
-                match mapdl::import(&self.map_import) {
-                    Ok(name) => {
-                        self.map_import.clear();
-                        self.say(format!("Peta {name} dipasang"));
+            if cfg!(target_os = "android") {
+                self.pick_button(ui, Pick::Map, "Pilih file .pmtiles");
+            } else {
+                ui.add(egui::TextEdit::singleline(&mut self.map_import).hint_text("lokasi file .pmtiles").desired_width(f32::INFINITY));
+                if ui.button("Impor").clicked() {
+                    match mapdl::import(&self.map_import) {
+                        Ok(name) => {
+                            self.map_import.clear();
+                            self.say(format!("Peta {name} dipasang"));
+                        }
+                        Err(e) => self.say(format!("Gagal mengimpor: {e}")),
                     }
-                    Err(e) => self.say(format!("Gagal mengimpor: {e}")),
                 }
             }
         });

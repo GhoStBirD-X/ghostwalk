@@ -153,3 +153,24 @@ pub fn insets() -> [i32; 5] {
     })
     .unwrap_or_default()
 }
+
+/// Opens the phone's file picker; the chosen file arrives later through `picked_file`.
+pub fn pick_file() {
+    with_class("id.ghostwalk.app.Files", |env, cls, act| {
+        env.call_static_method(cls, "pick", "(Landroid/app/Activity;)V", &[JValue::Object(act)])?;
+        Ok(())
+    });
+}
+
+/// The picked file once it is ready: a readable path, `Some("")` when cancelled, `None` while waiting.
+pub fn picked_file() -> Option<String> {
+    with_class("id.ghostwalk.app.Files", |env, cls, _| {
+        let s = env.call_static_method(cls, "take", "()Ljava/lang/String;", &[])?.l()?;
+        if s.is_null() {
+            return Ok(None);
+        }
+        let s: String = env.get_string(&s.into())?.into();
+        Ok(Some(s))
+    })
+    .flatten()
+}
