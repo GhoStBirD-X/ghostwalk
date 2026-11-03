@@ -389,12 +389,74 @@ pub struct Data {
     /// True while the sample activities from the first start are still there.
     #[serde(default)]
     pub has_samples: bool,
+    /// Ids of the sample activities, gear, goals and routes, so only those are removed later.
+    #[serde(default)]
+    pub sample_ids: Vec<u64>,
 }
 
 impl Data {
     pub fn new_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    /// Makes sure `new_id` never hands out an id that is already in use.
+    pub fn fix_next_id(&mut self) {
+        let used = self
+            .activities
+            .iter()
+            .map(|a| a.id)
+            .chain(self.gear.iter().map(|g| g.id))
+            .chain(self.goals.iter().map(|g| g.id))
+            .chain(self.routes.iter().map(|r| r.id))
+            .max()
+            .unwrap_or(0);
+        self.next_id = self.next_id.max(used);
+    }
+
+    /// Adds the sample activities, gear, goals and route next to what is already there, with fresh ids.
+    pub fn add_samples(&mut self) {
+        let s = sample_data();
+        let mut map = std::collections::HashMap::new();
+        for g in s.gear {
+            let id = self.new_id();
+            map.insert(g.id, id);
+            self.gear.push(Gear { id, ..g });
+        }
+        for a in s.activities {
+            let id = self.new_id();
+            let gear = a.gear.and_then(|g| map.get(&g).copied());
+            self.activities.push(Activity { id, gear, ..a });
+            self.sample_ids.push(id);
+        }
+        for g in s.goals {
+            let id = self.new_id();
+            self.goals.push(Goal { id, ..g });
+            self.sample_ids.push(id);
+        }
+        for r in s.routes {
+            let id = self.new_id();
+            self.routes.push(Route { id, ..r });
+            self.sample_ids.push(id);
+        }
+        self.sample_ids.extend(map.values());
+        self.has_samples = true;
+        self.sort();
+    }
+
+    /// Removes only the sample items; anything the user added stays.
+    pub fn remove_samples(&mut self) {
+        let ids: std::collections::HashSet<u64> = self.sample_ids.drain(..).collect();
+        self.activities.retain(|a| !ids.contains(&a.id));
+        self.gear.retain(|g| !ids.contains(&g.id));
+        self.goals.retain(|g| !ids.contains(&g.id));
+        self.routes.retain(|r| !ids.contains(&r.id));
+        for a in &mut self.activities {
+            if a.gear.is_some_and(|g| ids.contains(&g)) {
+                a.gear = None;
+            }
+        }
+        self.has_samples = false;
     }
 
     pub fn sort(&mut self) {
@@ -584,9 +646,35 @@ pub fn data_file() -> PathBuf {
     data_dir().join("data.json")
 }
 
-pub fn load() -> Option<Data> {
-    let s = std::fs::read_to_string(data_file()).ok()?;
-    serde_json::from_str(&s).ok()
+/// `Ok(None)` when there is no data yet. When the file cannot be read, the error says why and
+/// whether a copy was put aside; without a copy the app must not save over the file.
+pub fn load() -> Result<Option<Data>, (String, bool)> {
+    let path = data_file();
+    let s = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err((format!("Data tidak bisa dibaca: {e}"), false)),
+    };
+    match serde_json::from_str::<Data>(&s) {
+        Ok(mut d) => {
+            // Sample data from before `sample_ids` existed: it replaced everything, so its ids were the first ones.
+            if d.has_samples && d.sample_ids.is_empty() {
+                d.sample_ids = (1..=sample_data().next_id).collect();
+            }
+            d.fix_next_id();
+            Ok(Some(d))
+        }
+        Err(e) => {
+            let aside = data_dir().join(format!("data-rusak-{}.json", Local::now().format("%Y%m%d-%H%M%S")));
+            let kept = std::fs::copy(&path, &aside).is_ok();
+            let msg = if kept {
+                format!("Data tidak bisa dibaca ({e}). Salinannya disimpan di {}.", aside.display())
+            } else {
+                format!("Data tidak bisa dibaca ({e}). Perubahan tidak disimpan agar file lama tetap utuh.")
+            };
+            Err((msg, kept))
+        }
+    }
 }
 
 pub fn save(d: &Data) -> std::io::Result<()> {
@@ -612,7 +700,7 @@ fn sample_track(rng: &mut Rng, dist_m: f64, speed: f64, shape: f64) -> Vec<Track
     let (clat, clon) = (-6.2 + rng.f() * 0.01, 106.82 + rng.f() * 0.01);
     let wob = 0.15 + 0.25 * rng.f();
     let lobes = 2.0 + (shape * 3.0).floor();
-    let phase = rng.f() * 6.28;
+    let phase = rng.f() * std::f64::consts::TAU;
     // Base radius so the loop's length is roughly the target distance.
     let r = dist_m / (2.0 * std::f64::consts::PI * (1.0 + wob * 0.6));
     let n = (dist_m / 15.0).clamp(40.0, 2000.0) as usize;
@@ -750,6 +838,7 @@ pub fn sample_data() -> Data {
         ],
     });
     d.sort();
+    d.sample_ids = (1..=d.next_id).collect();
     d
 }
 
@@ -791,6 +880,25 @@ mod tests {
         assert!(same_route(&a, &loop_activity(2, 30.0, 1.0)), "a few metres of GPS drift");
         assert!(!same_route(&a, &loop_activity(3, 0.0, 1.6)), "a bigger loop");
         assert!(!same_route(&a, &loop_activity(4, 2000.0, 1.0)), "somewhere else");
+    }
+
+    #[test]
+    fn samples_come_and_go_without_touching_the_users_own_things() {
+        let mut d = Data::default();
+        let shoes = d.new_id();
+        d.gear.push(Gear { id: shoes, name: "Sepatu saya".into(), sport: Sport::Run, limit_km: 600.0, retired: false });
+        d.add_samples();
+        assert_eq!(d.gear.len(), 3, "own shoes kept next to the sample gear");
+        let mut own = loop_activity(d.new_id(), 0.0, 1.0);
+        own.gear = d.gear.iter().find(|g| g.id != shoes).map(|g| g.id);
+        let own_id = own.id;
+        d.activities.push(own);
+        d.remove_samples();
+        assert_eq!(d.activities.len(), 1);
+        assert_eq!(d.activities[0].id, own_id);
+        assert_eq!(d.activities[0].gear, None, "sample gear is gone, so the link is cleared");
+        assert_eq!(d.gear.len(), 1);
+        assert!(d.goals.is_empty() && d.routes.is_empty() && !d.has_samples);
     }
 
     #[test]

@@ -899,11 +899,8 @@ impl GhostApp {
             }
             ui.separator();
             if self.data.has_samples && ui.button("Hapus data contoh").clicked() {
-                self.data.activities.clear();
-                self.data.gear.clear();
-                self.data.routes.clear();
-                self.data.goals.clear();
-                self.data.has_samples = false;
+                // Only the sample items; activities, gear, goals and routes added since stay.
+                self.data.remove_samples();
                 self.save();
                 self.say("Data contoh dihapus");
             }
@@ -916,7 +913,9 @@ impl GhostApp {
                 ui.horizontal(|ui| {
                     if ui.button(RichText::new("Ya, hapus semua").color(draw::RED)).clicked() {
                         let s = self.data.settings.clone();
-                        self.data = model::Data { settings: s, ..Default::default() };
+                        // Keep counting ids on, so nothing old can come back under a reused id.
+                        self.data = model::Data { settings: s, next_id: self.data.next_id, ..Default::default() };
+                        self.undo = None;
                         self.confirm_wipe = false;
                         self.save();
                         self.say("Semua data dihapus");
@@ -939,8 +938,11 @@ impl GhostApp {
             .map_err(|e| e.to_string())
             .and_then(|s| serde_json::from_str::<model::Data>(&s).map_err(|e| e.to_string()))
         {
-            Ok(d) => {
+            Ok(mut d) => {
+                d.fix_next_id();
                 self.data = d;
+                // The deleted activity waiting for "Urungkan" belonged to the old data.
+                self.undo = None;
                 self.save();
                 self.say("Data dipulihkan");
             }

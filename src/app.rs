@@ -223,27 +223,52 @@ pub struct GhostApp {
 
 impl GhostApp {
     pub fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<PathBuf>) -> Self {
-        let persist = screenshot.is_none();
+        let mut persist = screenshot.is_none();
+        let mut load_error = None;
         let data = if persist {
-            model::load().unwrap_or_else(|| {
-                let mut d = Data::default();
-                d.settings.onboarded = false;
-                let _ = model::save(&d);
-                d
-            })
+            match model::load() {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    let mut d = Data::default();
+                    d.settings.onboarded = false;
+                    let _ = model::save(&d);
+                    d
+                }
+                Err((msg, kept)) => {
+                    // Never write over a file that could not be read unless a copy was put aside.
+                    persist = kept;
+                    load_error = Some(msg);
+                    Data::default()
+                }
+            }
         } else {
             model::sample_data()
         };
+        let crash_report = if screenshot.is_none() {
+            let crash = std::fs::read_to_string(model::crash_file()).ok();
+            match (load_error, crash) {
+                (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+                (a, b) => a.or(b),
+            }
+        } else {
+            None
+        };
+        let rec = if persist {
+            Recorder::restore(&data.settings).unwrap_or_else(|| Recorder::new(Sport::Run))
+        } else {
+            Recorder::new(Sport::Run)
+        };
+        let tab = if rec.active() || matches!(rec.state, RecState::Done { .. }) { Tab::Record } else { Tab::Home };
         draw::install_fonts(&cc.egui_ctx);
         let now = Local::now();
-        Self {
+        let mut app = Self {
             data,
             persist,
-            tab: Tab::Home,
+            tab,
             detail: None,
             edit: None,
             sub: None,
-            rec: Recorder::new(Sport::Run),
+            rec,
             manual: Form::blank(Sport::Run),
             show_manual: false,
             import_path: String::new(),
@@ -272,7 +297,7 @@ impl GhostApp {
             map_task: None,
             map_import: String::new(),
             map_delete: None,
-            crash_report: if persist { std::fs::read_to_string(model::crash_file()).ok() } else { None },
+            crash_report,
             picking: None,
             celebrate: None,
             undo: None,
@@ -290,7 +315,12 @@ impl GhostApp {
                 requested: false,
                 done: Arc::new(AtomicBool::new(false)),
             }),
+        };
+        if matches!(app.rec.state, RecState::Done { .. }) {
+            // A finished recording that was not saved yet when the app closed.
+            app.rec.form = app.recording_form();
         }
+        app
     }
 
     /// Opens a given screen at start (handy for checking screens one by one).
@@ -412,6 +442,9 @@ impl eframe::App for GhostApp {
         let [_, top, _, bottom, keyboard] = self.insets;
         // GPS and steps keep coming in whichever page is open.
         self.rec.poll();
+        if self.persist {
+            self.rec.keep_safe();
+        }
         #[cfg(target_os = "android")]
         if let Some(kind) = self.picking {
             ctx.request_repaint();
@@ -1013,7 +1046,7 @@ impl GhostApp {
                         ui.label(RichText::new(format!("{:>2}", i + 1)).monospace().color(draw::muted(ui)));
                         ui.label(RichText::new(draw::pace(1000.0 / s, false)).monospace());
                         let w = ui.available_width() - 8.0;
-                        let frac = if worst > 0.0 { (best / s) as f32 } else { 1.0 };
+                        let frac = if worst > 0.0 && *s > 0.0 { (best / s).clamp(0.0, 1.0) as f32 } else { 1.0 };
                         let (r, _) = ui.allocate_exact_size(vec2(w * frac, 12.0), Sense::hover());
                         let c = if *s == best { ACCENT } else { draw::sport_color(a.sport).gamma_multiply(0.55) };
                         ui.painter().rect_filled(r, 3.0, c);
@@ -1038,6 +1071,10 @@ impl GhostApp {
                 for (i, t) in a.laps.iter().enumerate() {
                     ui.label(format!("Putaran {}: {}", i + 1, draw::clock(t - prev)));
                     prev = *t;
+                }
+                // The stretch from the last lap press to the finish.
+                if a.duration_s > prev + 1.0 {
+                    ui.label(format!("Putaran {}: {}", a.laps.len() + 1, draw::clock(a.duration_s - prev)));
                 }
             });
         }

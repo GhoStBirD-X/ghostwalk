@@ -5,12 +5,38 @@ use crate::draw::{self, ACCENT};
 use crate::model::{self, Interval, Phase, Sport, TrackPoint};
 use chrono::{Local, TimeZone};
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke, Ui, vec2};
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// "2026-11-02 07:30", as the activity form shows it.
+fn when_text(start: i64) -> String {
+    Local.timestamp_opt(start, 0).single().unwrap_or_else(Local::now).format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// A recording in progress is kept here, so it survives the phone closing the app.
+fn snapshot_file() -> std::path::PathBuf {
+    model::data_dir().join("rekaman.json")
+}
+
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    sport: Sport,
+    state: RecState,
+    laps: Vec<f64>,
+    track: Vec<TrackPoint>,
+    steps: u32,
+    interval: Option<Interval>,
+    auto_pause: bool,
+    start_ms: i64,
+    paused_s: f64,
+    paused_since_ms: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
 pub enum RecState {
     Idle,
     /// The wall clock is used (not a monotonic one) so time keeps counting while the phone sleeps.
@@ -38,6 +64,15 @@ pub struct Recorder {
     start_ms: i64,
     paused_s: f64,
     paused_since_ms: Option<i64>,
+    /// Steps counted before the app was restarted in the middle of this recording.
+    steps_before: u32,
+    /// "Buang" was tapped once; a second tap throws the recording away.
+    confirm_discard: bool,
+    /// What the copy in `snapshot_file` was written for: (state, laps), when, and whether it exists.
+    saved_key: Option<(u8, usize)>,
+    saved_at: Option<Instant>,
+    saved_file: bool,
+    save_failed: bool,
 }
 
 impl Recorder {
@@ -56,6 +91,97 @@ impl Recorder {
             start_ms: 0,
             paused_s: 0.0,
             paused_since_ms: None,
+            steps_before: 0,
+            confirm_discard: false,
+            saved_key: None,
+            saved_at: None,
+            saved_file: false,
+            save_failed: false,
+        }
+    }
+
+    /// Picks up a recording that was still going (or not saved yet) when the app closed.
+    pub fn restore(settings: &model::Settings) -> Option<Self> {
+        let s: Snapshot = serde_json::from_str(&std::fs::read_to_string(snapshot_file()).ok()?).ok()?;
+        if matches!(s.state, RecState::Idle) {
+            return None;
+        }
+        let mut r = Self::new(s.sport);
+        r.state = s.state;
+        r.laps = s.laps;
+        r.track = s.track;
+        r.steps = s.steps;
+        r.steps_before = s.steps;
+        r.interval = s.interval;
+        r.auto_pause = s.auto_pause;
+        r.start_ms = s.start_ms;
+        r.paused_s = s.paused_s;
+        r.paused_since_ms = s.paused_since_ms;
+        r.saved_file = true;
+        #[cfg(target_os = "android")]
+        if r.active() {
+            crate::android::coach_begin(
+                settings.voice && r.sport.has_distance(),
+                r.sport.uses_speed(),
+                r.auto_pause,
+                r.sport.min_moving_speed(),
+                r.interval.map(|i| (i.work_s, i.rest_s, i.reps)),
+            );
+            if matches!(r.state, RecState::Paused { .. }) {
+                crate::android::coach_pause(true);
+            }
+        }
+        let _ = settings;
+        Some(r)
+    }
+
+    /// Writes the recording to `snapshot_file` when it changes and every 10 s while running,
+    /// and removes the file once the recording is saved or thrown away.
+    pub fn keep_safe(&mut self) {
+        let tag = match self.state {
+            RecState::Idle => {
+                if self.saved_file {
+                    let _ = std::fs::remove_file(snapshot_file());
+                    self.saved_file = false;
+                }
+                self.saved_key = None;
+                return;
+            }
+            RecState::Running { .. } => 1,
+            RecState::Paused { .. } => 2,
+            RecState::Done { .. } => 3,
+        };
+        let key = (tag, self.laps.len());
+        let waited = self.saved_at.is_none_or(|t| t.elapsed().as_secs() >= 10);
+        let changed = self.saved_key != Some(key);
+        // After a failed write, wait before trying again rather than retrying every frame.
+        let due = if self.save_failed { waited } else { changed || (tag == 1 && waited) };
+        if !due {
+            return;
+        }
+        let snap = Snapshot {
+            sport: self.sport,
+            state: self.state,
+            laps: self.laps.clone(),
+            track: self.track.clone(),
+            steps: self.steps,
+            interval: self.interval,
+            auto_pause: self.auto_pause,
+            start_ms: self.start_ms,
+            paused_s: self.paused_s,
+            paused_since_ms: self.paused_since_ms,
+        };
+        let path = snapshot_file();
+        let tmp = path.with_extension("json.tmp");
+        let ok = std::fs::create_dir_all(model::data_dir())
+            .and_then(|_| std::fs::write(&tmp, serde_json::to_vec(&snap).unwrap_or_default()))
+            .and_then(|_| std::fs::rename(&tmp, &path))
+            .is_ok();
+        self.saved_at = Some(Instant::now());
+        self.save_failed = !ok;
+        if ok {
+            self.saved_key = Some(key);
+            self.saved_file = true;
         }
     }
 
@@ -72,6 +198,8 @@ impl Recorder {
         self.laps.clear();
         self.track.clear();
         self.steps = 0;
+        self.steps_before = 0;
+        self.confirm_discard = false;
         self.gps_asked = None;
         self.interval = settings.interval.on.then_some(settings.interval);
         self.auto_pause = settings.auto_pause && self.sport.has_distance();
@@ -88,6 +216,7 @@ impl Recorder {
     pub fn pause(&mut self) {
         self.state = RecState::Paused { total: self.elapsed() };
         self.paused_since_ms = Some(now_ms());
+        self.confirm_discard = false;
         #[cfg(target_os = "android")]
         crate::android::coach_pause(true);
     }
@@ -97,6 +226,7 @@ impl Recorder {
             let now = now_ms();
             self.paused_s += self.paused_since_ms.take().map_or(0.0, |p| (now - p) as f64 / 1000.0);
             self.state = RecState::Running { since_ms: now, before: total };
+            self.confirm_discard = false;
             #[cfg(target_os = "android")]
             crate::android::coach_pause(false);
         }
@@ -163,7 +293,7 @@ impl Recorder {
                 }
             }
             if self.active() {
-                self.steps = crate::android::steps();
+                self.steps = self.steps_before + crate::android::steps();
             }
         }
     }
@@ -408,7 +538,13 @@ impl GhostApp {
             p.add(egui::Shape::convex_polygon(tri, Color32::WHITE, Stroke::NONE));
         }
         let side = egui::Rect::from_center_size(c + vec2(row.width() * 0.32, 0.0), vec2(96.0, 44.0));
-        let side_text = if running { "Putaran" } else { "Buang" };
+        let side_text = if running {
+            "Putaran"
+        } else if self.rec.confirm_discard {
+            "Ya, buang"
+        } else {
+            "Buang"
+        };
         let side_resp = ui.interact(side, ui.scope_id().with("rec_side"), Sense::click());
         p.rect_filled(side, 22.0, draw::raised(ui));
         p.text(
@@ -436,8 +572,14 @@ impl GhostApp {
         }
         if side_resp.clicked() {
             if running {
-                self.rec.laps.push(self.rec.elapsed());
+                // Moving time, like the activity's duration, so the last lap can be worked out later.
+                self.rec.laps.push(self.rec.moving());
+            } else if !self.rec.confirm_discard {
+                // One stray tap in a pocket must not lose the whole recording.
+                self.rec.confirm_discard = true;
+                self.say("Ketuk sekali lagi untuk membuang rekaman");
             } else {
+                self.rec.confirm_discard = false;
                 self.rec.stop();
                 self.rec.state = RecState::Idle;
                 self.rec.track.clear();
@@ -463,15 +605,23 @@ impl GhostApp {
         let total = self.rec.elapsed();
         self.rec.state = RecState::Done { total };
         self.rec.stop();
+        self.rec.form = self.recording_form();
+    }
+
+    /// The form for a finished recording, filled in from what was recorded.
+    pub fn recording_form(&self) -> Form {
         let mut f = Form::blank(self.rec.sport);
         if self.rec.track.len() > 1 {
             let (d, gain, _) = model::track_stats(&self.rec.track);
             f.dist_km = format!("{:.2}", d / 1000.0);
             f.elev = format!("{gain:.0}");
         }
-        f.title = default_title(self.rec.sport, Local::now().timestamp());
+        let start = self.rec.start_ms.div_euclid(1000);
+        f.title = default_title(self.rec.sport, start);
+        f.when = when_text(start);
+        f.time = draw::clock(self.rec.moving());
         f.gear = self.data.gear.iter().find(|g| g.sport == self.rec.sport && !g.retired).map(|g| g.id);
-        self.rec.form = f;
+        f
     }
 
     /// After recording: name it, check the numbers, save.
@@ -496,22 +646,24 @@ impl GhostApp {
             self.form_ui(ui, &mut form, false);
             ui.horizontal(|ui| {
                 if draw::accent_button(ui, "Simpan").clicked() {
-                    let start = Local::now().timestamp() - total as i64;
+                    // The real start of the recording, not the moment Simpan is pressed.
+                    let start = self.rec.start_ms.div_euclid(1000);
                     let mut a = self.empty_activity(form.sport, start);
                     a.duration_s = moving;
                     a.laps = self.rec.laps.clone();
-                    a.track = std::mem::take(&mut self.rec.track);
                     a.steps = (self.rec.steps > 0).then_some(self.rec.steps);
+                    // Fields left as filled in keep their exact values; changed ones are used as typed.
                     let mut f = form.clone();
-                    f.time.clear();
-                    f.when = Local
-                        .timestamp_opt(start, 0)
-                        .single()
-                        .unwrap_or_else(Local::now)
-                        .format("%Y-%m-%d %H:%M")
-                        .to_string();
+                    if f.time.trim() == draw::clock(moving) {
+                        f.time.clear();
+                    }
+                    let keep_start = f.when.trim() == when_text(start);
                     match f.apply(&mut a) {
                         Ok(()) => {
+                            if keep_start {
+                                a.start = start;
+                            }
+                            a.track = std::mem::take(&mut self.rec.track);
                             let id = a.id;
                             self.add_activity(a);
                             self.say("Aktivitas tersimpan");
@@ -531,6 +683,7 @@ impl GhostApp {
         if close {
             self.rec.state = RecState::Idle;
             self.rec.laps.clear();
+            self.rec.track.clear();
         }
     }
 

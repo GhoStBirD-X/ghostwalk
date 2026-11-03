@@ -169,7 +169,10 @@ impl GhostApp {
                     });
             });
         if restore {
-            if let Some((a, _)) = self.undo.take() {
+            if let Some((mut a, _)) = self.undo.take() {
+                if self.data.activities.iter().any(|b| b.id == a.id) {
+                    a.id = self.data.new_id();
+                }
                 self.data.activities.push(a);
                 self.save();
                 self.say("Aktivitas dikembalikan");
@@ -177,11 +180,9 @@ impl GhostApp {
         }
     }
 
-    /// Replaces the (empty) data with the sample activities, keeping the settings.
+    /// Adds the sample activities next to the user's own gear, goals and routes.
     pub fn load_samples(&mut self) {
-        let settings = self.data.settings.clone();
-        self.data = model::sample_data();
-        self.data.settings = settings;
+        self.data.add_samples();
         self.save();
     }
 

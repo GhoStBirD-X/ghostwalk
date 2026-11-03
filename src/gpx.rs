@@ -58,8 +58,18 @@ pub fn parse(text: &str) -> Result<(Option<String>, Option<i64>, Vec<TrackPoint>
     if pts.len() < 2 {
         return Err("Tidak ada titik rute di file ini".into());
     }
-    let name = inner(text, "name").map(|n| n.replace("<![CDATA[", "").replace("]]>", ""));
+    let name = inner(text, "name").map(|n| unesc(&n.replace("<![CDATA[", "").replace("]]>", "")));
     Ok((name, first_time.map(|t| t.timestamp()), pts))
+}
+
+/// Undoes XML escapes in text read from a file (`&amp;` last, so "&amp;lt;" stays "&lt;").
+fn unesc(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 fn esc(s: &str) -> String {
@@ -119,5 +129,14 @@ mod tests {
         let (dist, _, dur) = crate::model::track_stats(&pts);
         assert!((dist - a.distance_m).abs() < 5.0);
         assert!((dur - a.duration_s).abs() < 3.0);
+    }
+
+    #[test]
+    fn titles_with_xml_characters_come_back_the_same() {
+        let d = crate::model::sample_data();
+        let mut a = d.activities.iter().find(|a| a.track.len() > 1).unwrap().clone();
+        a.title = "Lari & gowes <pagi>".into();
+        let (name, _, _) = super::parse(&super::write(&a)).unwrap();
+        assert_eq!(name.as_deref(), Some("Lari & gowes <pagi>"));
     }
 }
