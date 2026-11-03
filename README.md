@@ -11,7 +11,8 @@ Pencatat olahraga yang **pribadi dan offline** untuk Android dan komputer (Linux
 - **Rekor dan rute**: perayaan saat memecahkan rekor atau mencapai target, dan perbandingan waktu di rute yang sama.
 - **Bagikan**: kartu gambar berisi rute dan angka, untuk dikirim lewat app apa pun.
 - **Target dan perlengkapan**: target mingguan/bulanan, jarak tempuh sepatu dan sepeda.
-- **Rute**: buat rute sendiri, peta jejak semua aktivitas.
+- **Rute**: buat rute sendiri, lalu lari mengikutinya: rute tampil di peta saat merekam, dengan sisa jarak dan peringatan (suara dan getar) saat keluar rute. Peta jejak semua aktivitas.
+- **Lawan hantu**: berlomba dengan lari Anda sebelumnya. Titik hantu bergerak di peta, selisih detik terlihat setiap saat, dan di setiap km terdengar apakah Anda di depan atau di belakang hantu, juga saat layar mati.
 - **Data milik Anda**: ekspor GPX dan CSV, cadangkan dan pulihkan dalam JSON.
 - Tema gelap dan terang, bahasa Indonesia.
 

@@ -327,6 +327,10 @@ impl GhostApp {
             // A finished recording that was not saved yet when the app closed.
             app.rec.form = app.recording_form();
         }
+        app.rec.arm(&app.data);
+        if app.rec.active() {
+            app.rec.send_plan();
+        }
         app
     }
 
@@ -362,6 +366,26 @@ impl GhostApp {
                 if let Some(a) = self.data.activities.iter().find(|a| a.sport == Sport::Run && a.track.len() > 1) {
                     self.rec.track = a.track.clone();
                     let since_ms = chrono::Utc::now().timestamp_millis() - (a.duration_s * 1000.0) as i64;
+                    self.rec.state = RecState::Running { since_ms, before: 0.0 };
+                }
+            }
+            "race_start" | "race" => {
+                // Racing the newest sample run; in "race" a bit slower than it, 40% of the way.
+                self.tab = Tab::Record;
+                let Some(a) = self.data.activities.iter().find(|a| a.sport == Sport::Run && a.track.len() > 10).cloned() else {
+                    return;
+                };
+                self.rec.sport = Sport::Run;
+                self.rec.ghost = Some(a.id);
+                self.rec.arm(&self.data);
+                if name == "race" {
+                    let settings = self.data.settings.clone();
+                    self.rec.begin(&settings);
+                    self.rec.gps = 2;
+                    let n = a.track.len() * 2 / 5;
+                    self.rec.track = a.track[..n].iter().map(|p| model::TrackPoint { t: p.t.map(|t| t * 1.04), ..*p }).collect();
+                    let t = self.rec.track.last().and_then(|p| p.t).unwrap_or(0.0);
+                    let since_ms = chrono::Utc::now().timestamp_millis() - (t * 1000.0) as i64;
                     self.rec.state = RecState::Running { since_ms, before: 0.0 };
                 }
             }
@@ -449,6 +473,7 @@ impl eframe::App for GhostApp {
         let [_, top, _, bottom, keyboard] = self.insets;
         // GPS and steps keep coming in whichever page is open.
         self.rec.poll();
+        self.rec.follow();
         if self.persist {
             self.rec.keep_safe();
         }
@@ -1109,6 +1134,9 @@ impl GhostApp {
                     Err(e) => self.say(format!("Gagal: {e}")),
                 }
             }
+            if model::Ghost::new(a.id, &a.track).is_some() && ui.button("Lawan hantu ini").clicked() {
+                self.race(a.sport, None, Some(a.id));
+            }
             if a.track.len() > 1 && ui.button("Jadikan rute").clicked() {
                 // Keeps where the route really is, thinned to about 200 points, always with the finish.
                 let step = (a.track.len() / 200).max(1);
@@ -1236,6 +1264,25 @@ impl GhostApp {
     }
 
     /// Adds a new activity, saves, and celebrates any record it sets.
+    /// Opens the Record page ready to follow `route` and race `ghost`.
+    pub fn race(&mut self, sport: Sport, route: Option<u64>, ghost: Option<u64>) {
+        if self.rec.active() || matches!(self.rec.state, RecState::Done { .. }) {
+            self.say("Selesaikan rekaman yang sekarang dulu");
+            self.tab = Tab::Record;
+            self.detail = None;
+            self.sub = None;
+            return;
+        }
+        self.rec.sport = sport;
+        self.rec.route = route;
+        self.rec.ghost = ghost;
+        self.rec.arm(&self.data);
+        self.tab = Tab::Record;
+        self.detail = None;
+        self.sub = None;
+        self.say(if self.rec.ghost.is_some() { "Hantu siap. Tekan Mulai untuk berlomba" } else { "Rute siap. Tekan Mulai" });
+    }
+
     pub fn add_activity(&mut self, a: Activity) {
         let wins = self.wins(&a);
         self.data.activities.push(a);

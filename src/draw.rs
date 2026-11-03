@@ -6,6 +6,8 @@ use eframe::egui::{self, Align2, Color32, FontFamily, FontId, Pos2, Rect, RichTe
 pub const ACCENT: Color32 = Color32::from_rgb(255, 92, 38);
 pub const GREEN: Color32 = Color32::from_rgb(46, 170, 90);
 pub const RED: Color32 = Color32::from_rgb(220, 60, 60);
+/// The ghost: an earlier activity raced against.
+pub const GHOST: Color32 = Color32::from_rgb(140, 110, 255);
 
 pub fn sport_color(s: Sport) -> Color32 {
     match s {
@@ -923,6 +925,56 @@ pub fn route_map(ui: &mut Ui, track: &[TrackPoint], color: Color32, height: f32,
         zoom_buttons(ui, &p, rect, moved, view.rot);
     }
     resp
+}
+
+/// The map while recording (and before the start): the planned route faint underneath, the track
+/// so far with where you are now, and where the ghost is.
+pub fn live_map(
+    ui: &mut Ui,
+    track: &[TrackPoint],
+    plan: &[TrackPoint],
+    ghost: Option<TrackPoint>,
+    color: Color32,
+    height: f32,
+    around: Color32,
+) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let p = ui.painter_at(rect);
+    map_backdrop(ui, &p, rect, 10.0);
+    let (tr, pl) = (merc(track), merc(plan));
+    let gh = ghost.map(|g| merc(&[g])[0]);
+    if tr.len() + pl.len() < 2 || !ui.is_rect_visible(rect) {
+        round_corners(&p, rect, 14.0, around);
+        return;
+    }
+    let ghost_path = gh.map(|g| vec![g]).unwrap_or_default();
+    let view = fit_view(&[&tr, &pl, &ghost_path], rect, 22.0);
+    let dark = ui.visuals().dark_mode;
+    let has_map = crate::offmap::draw(&p, rect, &view, dark);
+    if pl.len() > 1 {
+        let line: Vec<Pos2> = pl.iter().map(|q| view.to_screen(*q)).collect();
+        let faint = if dark { Color32::from_gray(200) } else { Color32::from_gray(90) };
+        p.line(line.clone(), Stroke::new(7.0, faint.gamma_multiply(0.35)));
+        p.circle(line[0], 5.0, GREEN, Stroke::new(2.0, Color32::WHITE));
+        p.circle(*line.last().unwrap(), 5.0, RED, Stroke::new(2.0, Color32::WHITE));
+    }
+    if tr.len() > 1 {
+        let line: Vec<Pos2> = tr.iter().map(|q| view.to_screen(*q)).collect();
+        p.line(line.clone(), Stroke::new(10.0, color.gamma_multiply(0.22)));
+        p.line(line, Stroke::new(3.5, color));
+    }
+    if let Some(g) = gh {
+        let at = view.to_screen(g);
+        p.circle(at, 7.5, GHOST, Stroke::new(2.5, Color32::WHITE));
+        p.text(at - vec2(0.0, 12.0), Align2::CENTER_BOTTOM, "hantu", FontId::new(11.0, semi()), GHOST);
+    }
+    if let Some(me) = tr.last() {
+        p.circle(view.to_screen(*me), 8.0, color, Stroke::new(3.0, Color32::WHITE));
+    }
+    if has_map {
+        crate::offmap::attribution(&p, rect, dark);
+    }
+    round_corners(&p, rect, 14.0, around);
 }
 
 /// The route planner's map: the offline map around `center` (latitude, longitude), about 4 km

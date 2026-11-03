@@ -43,6 +43,7 @@ impl GhostApp {
             });
         }
         let mut delete = None;
+        let mut use_route = None;
         for r in self.data.routes.clone() {
             draw::card(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -78,12 +79,31 @@ impl GhostApp {
                         }
                     });
                 });
+                if !r.geo.is_empty() {
+                    let runs = self.data.ghost_choices(r.sport, Some(&r));
+                    let best = runs.first().map(|a| (a.id, a.duration_s));
+                    let n = runs.len();
+                    if let Some((_, t)) = best {
+                        ui.label(
+                            RichText::new(format!("Sudah {n} kali dilari. Terbaik {}.", draw::clock(t)))
+                                .size(12.5)
+                                .color(draw::muted(ui)),
+                        );
+                    }
+                    let text = if best.is_some() { "Lari rute ini lawan hantu terbaik" } else { "Lari rute ini" };
+                    if draw::accent_button(ui, text).clicked() {
+                        use_route = Some((r.sport, r.id, best.map(|b| b.0)));
+                    }
+                }
             });
             ui.add_space(8.0);
         }
         if let Some(id) = delete {
             self.data.routes.retain(|r| r.id != id);
             self.save();
+        }
+        if let Some((sport, id, ghost)) = use_route {
+            self.race(sport, Some(id), ghost);
         }
     }
 

@@ -34,6 +34,10 @@ struct Snapshot {
     start_ms: i64,
     paused_s: f64,
     paused_since_ms: Option<i64>,
+    #[serde(default)]
+    route: Option<u64>,
+    #[serde(default)]
+    ghost: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -68,6 +72,16 @@ pub struct Recorder {
     steps_before: u32,
     /// "Buang" was tapped once; a second tap throws the recording away.
     confirm_discard: bool,
+    /// The saved route to follow and the activity to race, chosen before the start.
+    pub route: Option<u64>,
+    pub ghost: Option<u64>,
+    /// Filled in from those by `arm`: the route's points and metres along it, and the ghost.
+    pub plan: Vec<TrackPoint>,
+    pub plan_cum: Vec<f64>,
+    pub ghost_run: Option<model::Ghost>,
+    /// Metres along the route reached so far, and how far the last position was from it.
+    pub route_at: f64,
+    pub off_m: Option<f64>,
     /// What the copy in `snapshot_file` was written for: (state, laps), when, and whether it exists.
     saved_key: Option<(u8, usize)>,
     saved_at: Option<Instant>,
@@ -93,6 +107,13 @@ impl Recorder {
             paused_since_ms: None,
             steps_before: 0,
             confirm_discard: false,
+            route: None,
+            ghost: None,
+            plan: Vec::new(),
+            plan_cum: Vec::new(),
+            ghost_run: None,
+            route_at: 0.0,
+            off_m: None,
             saved_key: None,
             saved_at: None,
             saved_file: false,
@@ -117,6 +138,8 @@ impl Recorder {
         r.start_ms = s.start_ms;
         r.paused_s = s.paused_s;
         r.paused_since_ms = s.paused_since_ms;
+        r.route = s.route;
+        r.ghost = s.ghost;
         r.saved_file = true;
         #[cfg(target_os = "android")]
         if r.active() {
@@ -127,7 +150,8 @@ impl Recorder {
                 r.sport.min_moving_speed(),
                 r.interval.map(|i| (i.work_s, i.rest_s, i.reps)),
             );
-            crate::android::coach_carry_over(r.distance(), r.elapsed(), r.moving());
+            let first = r.track.first().and_then(|p| p.t).unwrap_or(-1.0);
+            crate::android::coach_carry_over(r.distance(), r.elapsed(), r.moving(), first);
             if matches!(r.state, RecState::Paused { .. }) {
                 crate::android::coach_pause(true);
             }
@@ -171,6 +195,8 @@ impl Recorder {
             start_ms: self.start_ms,
             paused_s: self.paused_s,
             paused_since_ms: self.paused_since_ms,
+            route: self.route,
+            ghost: self.ghost,
         };
         let path = snapshot_file();
         let tmp = path.with_extension("json.tmp");
@@ -202,6 +228,8 @@ impl Recorder {
         self.steps_before = 0;
         self.confirm_discard = false;
         self.gps_asked = None;
+        self.route_at = 0.0;
+        self.off_m = None;
         self.interval = settings.interval.on.then_some(settings.interval);
         self.auto_pause = settings.auto_pause && self.sport.has_distance();
         #[cfg(target_os = "android")]
@@ -212,6 +240,72 @@ impl Recorder {
             self.sport.min_moving_speed(),
             self.interval.map(|i| (i.work_s, i.rest_s, i.reps)),
         );
+    }
+
+    /// Looks up the chosen route and ghost in `data`, dropping a choice that no longer exists.
+    pub fn arm(&mut self, data: &model::Data) {
+        let route = self.route.and_then(|id| data.routes.iter().find(|r| r.id == id && r.geo.len() >= 2));
+        self.route = route.map(|r| r.id);
+        self.plan = route.map(|r| r.track()).unwrap_or_default();
+        self.plan_cum = model::cumulative(&self.plan);
+        self.ghost_run = self
+            .ghost
+            .and_then(|id| data.activities.iter().find(|a| a.id == id))
+            .and_then(|a| model::Ghost::new(a.id, &a.track));
+        self.ghost = self.ghost_run.as_ref().map(|g| g.id);
+    }
+
+    /// Hands the route and ghost to the phone's coach, for spoken updates with the screen off.
+    pub fn send_plan(&self) {
+        #[cfg(target_os = "android")]
+        {
+            let route: Vec<f64> = self.plan.iter().flat_map(|p| [p.lat, p.lon]).collect();
+            let ghost: Vec<f64> = self
+                .ghost_run
+                .as_ref()
+                .map(|g| g.cum.iter().zip(&g.times).flat_map(|(d, t)| [*d, *t]).collect())
+                .unwrap_or_default();
+            crate::android::coach_plan(&route, &ghost);
+        }
+    }
+
+    /// The clock for racing the ghost: from the first GPS position, as the ghost's own clock is,
+    /// so the wait for a signal is not counted. None before the first position.
+    pub fn race_clock(&self) -> Option<f64> {
+        let t0 = self.track.first()?.t?;
+        Some((self.elapsed() - t0).max(0.0))
+    }
+
+    /// The route actually shown: the planned one, or else the ghost's.
+    pub fn shown_plan(&self) -> &[TrackPoint] {
+        match &self.ghost_run {
+            Some(g) if self.plan.is_empty() => &g.track,
+            _ => &self.plan,
+        }
+    }
+
+    /// Keeps up where on the route the newest position is.
+    pub fn follow(&mut self) {
+        let Some(last) = self.track.last().copied() else {
+            self.off_m = None;
+            return;
+        };
+        if self.plan.len() < 2 || !self.active() {
+            self.off_m = None;
+            return;
+        }
+        let (mut along, mut off) = model::locate_on(&self.plan, &self.plan_cum, &last, self.route_at, 300.0);
+        if off > 150.0 {
+            // Joined the route somewhere else (a shortcut, or a start halfway along it).
+            let (a, o) = model::locate_on(&self.plan, &self.plan_cum, &last, 0.0, f64::MAX);
+            if o < 50.0 {
+                (along, off) = (a, o);
+            }
+        }
+        if off < 100.0 {
+            self.route_at = along;
+        }
+        self.off_m = Some(off);
     }
 
     pub fn pause(&mut self) {
@@ -335,8 +429,12 @@ impl GhostApp {
         draw::card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for s in Sport::ALL {
-                    if draw::chip(ui, self.rec.sport == s, s.name()).clicked() {
+                    if draw::chip(ui, self.rec.sport == s, s.name()).clicked() && self.rec.sport != s {
                         self.rec.sport = s;
+                        // Routes and ghosts belong to one sport.
+                        self.rec.route = None;
+                        self.rec.ghost = None;
+                        self.rec.arm(&self.data);
                     }
                 }
             });
@@ -398,10 +496,13 @@ impl GhostApp {
             if changed {
                 self.save();
             }
+            self.record_plan(ui);
             ui.add_space(6.0);
             if draw::accent_button(ui, "Mulai").clicked() {
                 let settings = self.data.settings.clone();
+                self.rec.arm(&self.data);
                 self.rec.begin(&settings);
+                self.rec.send_plan();
             }
             if self.rec.gps < 0 {
                 ui.label(
@@ -411,6 +512,161 @@ impl GhostApp {
                 );
             }
         });
+    }
+
+    /// Before the start: a saved route to follow and an earlier activity to race (the "ghost").
+    fn record_plan(&mut self, ui: &mut Ui) {
+        let imp = self.data.settings.imperial;
+        let sport = self.rec.sport;
+        let routes: Vec<(u64, String)> = self
+            .data
+            .routes
+            .iter()
+            .filter(|r| r.sport == sport && r.geo.len() >= 2)
+            .map(|r| (r.id, r.name.clone()))
+            .collect();
+        let route = self.rec.route.and_then(|id| self.data.routes.iter().find(|r| r.id == id)).cloned();
+        let ghosts: Vec<(u64, String)> = self
+            .data
+            .ghost_choices(sport, route.as_ref())
+            .iter()
+            .take(6)
+            .map(|a| {
+                let t = a.track.last().and_then(|p| p.t).unwrap_or(0.0) - a.track[0].t.unwrap_or(0.0);
+                (a.id, format!("{} · {} · {}", a.date().format("%d/%m"), draw::dist(a.distance_m, imp), draw::clock(t)))
+            })
+            .collect();
+        if routes.is_empty() && ghosts.is_empty() {
+            return;
+        }
+        let (old_route, old_ghost) = (self.rec.route, self.rec.ghost);
+        ui.add_space(6.0);
+        if !routes.is_empty() {
+            ui.label(RichText::new("Rute").size(12.5).color(draw::muted(ui)));
+            ui.horizontal_wrapped(|ui| {
+                if draw::chip(ui, self.rec.route.is_none(), "Bebas").clicked() {
+                    self.rec.route = None;
+                }
+                for (id, name) in &routes {
+                    if draw::chip(ui, self.rec.route == Some(*id), name).clicked() {
+                        self.rec.route = Some(*id);
+                    }
+                }
+            });
+        }
+        if self.rec.route != old_route {
+            // A new route: race the best time on it, if there is one.
+            let r = self.rec.route.and_then(|id| self.data.routes.iter().find(|r| r.id == id));
+            self.rec.ghost = r.and_then(|r| self.data.ghost_choices(sport, Some(r)).first().map(|a| a.id));
+            self.rec.arm(&self.data);
+            return;
+        }
+        ui.add_space(4.0);
+        ui.label(RichText::new("Lawan hantu (lari Anda sebelumnya)").size(12.5).color(draw::muted(ui)));
+        if ghosts.is_empty() {
+            ui.label(
+                RichText::new("Belum ada lari di rute ini. Lari ini nanti bisa jadi hantunya.").size(11.5).color(draw::muted(ui)),
+            );
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                if draw::chip(ui, self.rec.ghost.is_none(), "Tanpa hantu").clicked() {
+                    self.rec.ghost = None;
+                }
+                for (i, (id, text)) in ghosts.iter().enumerate() {
+                    let text = if i == 0 && route.is_some() { format!("Terbaik {text}") } else { text.clone() };
+                    if draw::chip(ui, self.rec.ghost == Some(*id), &text).clicked() {
+                        self.rec.ghost = Some(*id);
+                    }
+                }
+            });
+        }
+        if self.rec.ghost != old_ghost {
+            self.rec.arm(&self.data);
+        }
+        let shown = self.rec.shown_plan();
+        if shown.len() > 1 {
+            ui.add_space(6.0);
+            let around = draw::card_bg(ui);
+            let ghost_at = self.rec.ghost_run.as_ref().map(|g| g.track[0]);
+            draw::live_map(ui, &[], shown, ghost_at, draw::sport_color(sport), 150.0, around);
+            let mut line = format!("Jarak {}", draw::dist(model::cumulative(shown).last().copied().unwrap_or(0.0), imp));
+            if let Some(g) = &self.rec.ghost_run {
+                line += &format!(" · waktu hantu {}", draw::clock(g.total_s()));
+            }
+            ui.label(RichText::new(line).size(12.5).color(draw::muted(ui)));
+        }
+    }
+
+    /// While recording: how the race with the ghost stands, and how much of the route is left.
+    fn record_race(&mut self, ui: &mut Ui) {
+        let imp = self.data.settings.imperial;
+        let d = self.rec.distance();
+        let clock = self.rec.race_clock();
+        if let Some(g) = &self.rec.ghost_run {
+            let t = clock.unwrap_or(0.0);
+            let gap = if clock.is_some() { g.gap(d, t) } else { 0.0 };
+            let (head, sub, color) = if clock.is_none() {
+                ("HANTU SIAP", "mulai berlomba saat GPS dapat sinyal".to_string(), draw::GHOST)
+            } else if d >= g.total_m() {
+                if gap <= 0.0 {
+                    ("MENGALAHKAN HANTU", format!("{} lebih cepat", draw::clock(-gap)), draw::lime(ui))
+                } else {
+                    ("KALAH DARI HANTU", format!("{} lebih lambat", draw::clock(gap)), draw::RED)
+                }
+            } else if t >= g.total_s() {
+                ("HANTU SUDAH FINISH", format!("sisa {}", draw::dist(g.total_m() - d, imp)), draw::RED)
+            } else {
+                let lead = g.dist_at(t) - d;
+                let side = if lead > 0.0 { "depan" } else { "belakang" };
+                let sub = format!("hantu {} di {side} Anda", draw::dist(lead.abs(), imp));
+                if gap <= 0.0 {
+                    ("DI DEPAN HANTU", sub, draw::lime(ui))
+                } else {
+                    ("DI BELAKANG HANTU", sub, ACCENT)
+                }
+            };
+            let sign = match clock {
+                None => "",
+                Some(_) if gap <= 0.0 => "-",
+                Some(_) => "+",
+            };
+            egui::Frame::new()
+                .fill(draw::GHOST.gamma_multiply(0.14))
+                .stroke(Stroke::new(1.0, draw::GHOST.gamma_multiply(0.6)))
+                .corner_radius(18.0)
+                .inner_margin(14.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(head).family(draw::heavy()).size(16.0).color(color));
+                            ui.label(RichText::new(sub).size(12.5).color(draw::muted(ui)));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(draw::big(format!("{sign}{}", draw::clock(gap.abs())), 36.0, color));
+                        });
+                    });
+                });
+            ui.add_space(8.0);
+        }
+        if self.rec.plan.len() > 1 {
+            let total = self.rec.plan_cum.last().copied().unwrap_or(0.0);
+            let left = (total - self.rec.route_at).max(0.0);
+            let off = self.rec.off_m.filter(|o| *o > 50.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Sisa rute {}", draw::dist(left, imp))).family(draw::semi()).color(draw::strong(ui)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(o) = off {
+                        draw::pill(ui, &format!("Keluar rute {:.0} m", o), draw::RED, true);
+                    }
+                });
+            });
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 8.0), Sense::hover());
+            let f = if total > 0.0 { (self.rec.route_at / total).clamp(0.0, 1.0) as f32 } else { 0.0 };
+            ui.painter().rect_filled(r, 4.0, draw::raised(ui));
+            ui.painter().rect_filled(egui::Rect::from_min_size(r.min, vec2(r.width() * f, r.height())), 4.0, draw::sport_color(self.rec.sport));
+            ui.add_space(8.0);
+        }
     }
 
     /// While recording: big numbers you can read on the move, and controls that are hard to hit by accident.
@@ -475,6 +731,7 @@ impl GhostApp {
             ui.add_space(8.0);
         }
 
+        self.record_race(ui);
         let has_distance = self.rec.sport.has_distance();
         if has_distance {
             let txt = draw::dist(d, imp);
@@ -598,10 +855,12 @@ impl GhostApp {
             self.finish_recording();
         }
         // Below the controls, and not draggable, so the page still scrolls with a thumb on it.
-        if self.rec.track.len() > 1 {
+        if self.rec.track.len() > 1 || self.rec.shown_plan().len() > 1 {
             ui.add_space(12.0);
             let around = draw::bg(ui);
-            draw::route_map(ui, &self.rec.track, draw::sport_color(self.rec.sport), 170.0, false, around);
+            let ghost_at = self.rec.ghost_run.as_ref().map(|g| g.pos_at(self.rec.race_clock().unwrap_or(0.0)));
+            let color = draw::sport_color(self.rec.sport);
+            draw::live_map(ui, &self.rec.track, self.rec.shown_plan(), ghost_at, color, 200.0, around);
         }
         if running {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
@@ -671,10 +930,19 @@ impl GhostApp {
                             if keep_start {
                                 a.start = start;
                             }
+                            let verdict = self.ghost_verdict();
                             a.track = std::mem::take(&mut self.rec.track);
                             let id = a.id;
                             self.add_activity(a);
                             self.say("Aktivitas tersimpan");
+                            match verdict {
+                                Some((true, msg)) => match &mut self.celebrate {
+                                    Some((wins, _)) => wins.push(msg),
+                                    None => self.celebrate = Some((vec![msg], Instant::now())),
+                                },
+                                Some((false, msg)) => self.say(msg),
+                                None => {}
+                            }
                             self.detail = Some(id);
                             self.tab = Tab::Home;
                             close = true;
@@ -698,10 +966,30 @@ impl GhostApp {
         self.rec.form = form;
         if close {
             self.rec.confirm_discard = false;
+            self.rec.route = None;
+            self.rec.ghost = None;
+            self.rec.arm(&self.data);
             self.rec.state = RecState::Idle;
             self.rec.laps.clear();
             self.rec.track.clear();
         }
+    }
+
+    /// Whether the finished recording beat its ghost, with the line to show; None if it did not go the distance.
+    fn ghost_verdict(&self) -> Option<(bool, String)> {
+        let g = self.rec.ghost_run.as_ref()?;
+        let me = model::Ghost::new(0, &self.rec.track)?;
+        // A few metres short of the ghost's finish still counts.
+        if me.total_m() < g.total_m() * 0.97 {
+            return None;
+        }
+        let at = g.total_m().min(me.total_m());
+        let gap = me.time_at(at)? - g.time_at(at)?;
+        Some(if gap <= 0.0 {
+            (true, format!("Mengalahkan hantu, {} lebih cepat", draw::clock(-gap)))
+        } else {
+            (false, format!("Kalah {} dari hantu. Coba lagi!", draw::clock(gap)))
+        })
     }
 
     /// Manual entry and GPX import, below the start card.

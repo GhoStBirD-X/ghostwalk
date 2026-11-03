@@ -225,14 +225,28 @@ pub fn coach_begin(voice: bool, by_speed: bool, auto_pause: bool, min_speed: f64
 }
 
 /// After `coach_begin` for a recording picked up again: the distance and time it already had.
-pub fn coach_carry_over(dist_m: f64, elapsed_s: f64, moving_s: f64) {
+/// `first_s` is when the first GPS position came, on the recording clock (-1 if none yet).
+pub fn coach_carry_over(dist_m: f64, elapsed_s: f64, moving_s: f64, first_s: f64) {
     with_class("id.ghostwalk.app.Coach", |env, cls, _| {
         env.call_static_method(
             cls,
             "carryOver",
-            "(DDD)V",
-            &[JValue::Double(dist_m), JValue::Double(elapsed_s), JValue::Double(moving_s)],
+            "(DDDD)V",
+            &[JValue::Double(dist_m), JValue::Double(elapsed_s), JValue::Double(moving_s), JValue::Double(first_s)],
         )?;
+        Ok(())
+    });
+}
+
+/// After `coach_begin`: the planned route as [lat, lon, lat, lon, …] and the ghost as
+/// [metres, seconds, …] (either may be empty), for "off the route" and ghost updates by voice.
+pub fn coach_plan(route: &[f64], ghost: &[f64]) {
+    with_class("id.ghostwalk.app.Coach", |env, cls, _| {
+        let r = env.new_double_array(route.len() as i32)?;
+        env.set_double_array_region(&r, 0, route)?;
+        let g = env.new_double_array(ghost.len() as i32)?;
+        env.set_double_array_region(&g, 0, ghost)?;
+        env.call_static_method(cls, "plan", "([D[D)V", &[JValue::Object(&r), JValue::Object(&g)])?;
         Ok(())
     });
 }

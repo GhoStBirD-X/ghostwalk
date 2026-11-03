@@ -54,6 +54,17 @@ public class Coach implements SensorEventListener {
     private static float lastCount = -1;
     private static volatile int steps;
 
+    /** The planned route as [lat, lon, …], or empty; whether the runner is off it, and since when (ms). */
+    private static double[] route = new double[0];
+    private static boolean offRoute;
+    private static long offSince;
+    /** The ghost as [metres, seconds, …] on its own recording clock, or empty. */
+    private static double[] ghost = new double[0];
+    private static boolean ghostBeaten;
+    /** The recording clock at the first GPS position (-1 before it): the ghost's clock starts there too. */
+    private static double firstFixS = -1;
+    private static boolean ghostFinished;
+
     private static int work;
     private static int rest;
     private static int reps;
@@ -109,6 +120,13 @@ public class Coach implements SensorEventListener {
         rest = restS;
         reps = repCount;
         tick = 0;
+        route = new double[0];
+        ghost = new double[0];
+        offRoute = false;
+        offSince = 0;
+        ghostBeaten = false;
+        ghostFinished = false;
+        firstFixS = -1;
         pending = null;
         greeting = reps > 0 ? null : "Rekaman dimulai.";
         if (voice) {
@@ -125,7 +143,8 @@ public class Coach implements SensorEventListener {
      * Picks up where a recording was when the app was closed, right after `begin`: the distance and
      * clock so far, so the notification and the next spoken kilometre carry on instead of starting over.
      */
-    public static void carryOver(double distM, double elapsedS, double movingS) {
+    public static void carryOver(double distM, double elapsedS, double movingS, double firstS) {
+        firstFixS = firstS;
         long now = System.currentTimeMillis();
         startMs = now - (long) (elapsedS * 1000);
         pausedMs = 0;
@@ -138,6 +157,17 @@ public class Coach implements SensorEventListener {
         greeting = "Rekaman dilanjutkan.";
     }
 
+    /** The route to stay on and the ghost to race, right after `begin` (and `carryOver`). */
+    public static void plan(double[] routeLatLon, double[] ghostDistTime) {
+        route = routeLatLon;
+        ghost = ghostDistTime;
+        offRoute = false;
+        offSince = 0;
+        // Picked up again after the app was closed: don't announce what already happened.
+        ghostBeaten = ghost.length >= 2 && dist >= ghost[ghost.length - 2];
+        ghostFinished = ghost.length >= 2 && raceS() >= ghost[ghost.length - 1];
+    }
+
     public static void setPaused(boolean p) {
         long now = System.currentTimeMillis();
         if (p && !paused) {
@@ -147,6 +177,18 @@ public class Coach implements SensorEventListener {
         }
         paused = p;
         last = null;
+    }
+
+    /** The recording clock with standing still included, as the ghost's own times are. */
+    private static double clockS() {
+        long now = System.currentTimeMillis();
+        long off = pausedMs + (paused ? now - pauseStartMs : 0);
+        return Math.max(0, (now - startMs - off) / 1000.0);
+    }
+
+    /** Seconds since the first GPS position, to compare with the ghost. */
+    private static double raceS() {
+        return firstFixS < 0 ? 0 : Math.max(0, clockS() - firstFixS);
     }
 
     private static double elapsed() {
@@ -281,6 +323,9 @@ public class Coach implements SensorEventListener {
         if (!active || paused || l.getAccuracy() > 35) {
             return;
         }
+        if (firstFixS < 0) {
+            firstFixS = clockS();
+        }
         if (last != null) {
             double d = last.distanceTo(l);
             double dt = (l.getTime() - last.getTime()) / 1000.0;
@@ -312,9 +357,108 @@ public class Coach implements SensorEventListener {
             double kmTime = moving - kmStartMoving;
             kmStartMoving = moving;
             if (voice) {
-                say(kmSentence(nextKm, kmTime));
+                say(kmSentence(nextKm, kmTime) + ghostSentence());
             }
             nextKm++;
+        }
+        checkRoute(l);
+        checkGhost();
+    }
+
+    /** Warns once after 10 s more than 60 m from the route, and again when back on it. */
+    private static void checkRoute(Location l) {
+        if (route.length < 4) {
+            return;
+        }
+        double off = offRoute(l.getLatitude(), l.getLongitude());
+        long now = System.currentTimeMillis();
+        if (!offRoute && off > 60) {
+            if (offSince == 0) {
+                offSince = now;
+            } else if (now - offSince >= 10000) {
+                offRoute = true;
+                buzz(600);
+                if (voice) {
+                    say("Anda keluar dari rute.");
+                }
+            }
+        } else if (off <= 60) {
+            offSince = 0;
+            if (offRoute && off < 35) {
+                offRoute = false;
+                buzz(150);
+                if (voice) {
+                    say("Kembali di rute.");
+                }
+            }
+        }
+    }
+
+    /** Metres from (lat, lon) to the nearest piece of the route. */
+    private static double offRoute(double lat, double lon) {
+        double k = 111320;
+        double cos = Math.cos(Math.toRadians(lat));
+        double best = Double.MAX_VALUE;
+        for (int i = 2; i + 1 < route.length; i += 2) {
+            double ax = (route[i - 1] - lon) * k * cos, ay = (route[i - 2] - lat) * k;
+            double bx = (route[i + 1] - lon) * k * cos, by = (route[i] - lat) * k;
+            double dx = bx - ax, dy = by - ay;
+            double len2 = dx * dx + dy * dy;
+            double f = len2 > 0 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / len2)) : 0;
+            best = Math.min(best, Math.hypot(ax + dx * f, ay + dy * f));
+        }
+        return best;
+    }
+
+    /** Seconds the ghost needed for `d` metres, or -1 past its finish. */
+    private static double ghostTime(double d) {
+        int n = ghost.length / 2;
+        if (n < 2 || d > ghost[2 * n - 2]) {
+            return -1;
+        }
+        for (int i = 1; i < n; i++) {
+            double d1 = ghost[2 * i];
+            if (d1 >= d) {
+                double d0 = ghost[2 * i - 2], t0 = ghost[2 * i - 1], t1 = ghost[2 * i + 1];
+                return d1 > d0 ? t0 + (t1 - t0) * (d - d0) / (d1 - d0) : t1;
+            }
+        }
+        return ghost[2 * n - 1];
+    }
+
+    /** " Anda 12 detik di depan hantu." for the kilometre update, or nothing without a ghost. */
+    private static String ghostSentence() {
+        double g = ghostTime(dist);
+        if (g < 0) {
+            return "";
+        }
+        long gap = Math.round(raceS() - g);
+        if (Math.abs(gap) < 2) {
+            return " Sejajar dengan hantu.";
+        }
+        return " Anda " + Math.abs(gap) + " detik di " + (gap < 0 ? "depan" : "belakang") + " hantu.";
+    }
+
+    /** Says once who reached the ghost's finish first. */
+    private static void checkGhost() {
+        if (ghost.length < 4) {
+            return;
+        }
+        double total = ghost[ghost.length - 2];
+        double totalS = ghost[ghost.length - 1];
+        if (!ghostBeaten && !ghostFinished && dist >= total) {
+            ghostBeaten = true;
+            buzz(900);
+            if (voice) {
+                say("Anda mengalahkan hantu, " + Math.round(totalS - raceS()) + " detik lebih cepat!");
+            }
+        } else if (!ghostFinished && !ghostBeaten && firstFixS >= 0 && raceS() >= totalS) {
+            ghostFinished = true;
+            buzz(400);
+            if (voice) {
+                long left = Math.round(total - dist);
+                say("Hantu sudah sampai finish. Sisa " + left + " meter.");
+            }
         }
     }
 

@@ -536,6 +536,24 @@ impl Data {
         v
     }
 
+    /// Activities to race against on `route` (or any of `sport` without a route), fastest first.
+    pub fn ghost_choices(&self, sport: Sport, route: Option<&Route>) -> Vec<&Activity> {
+        let plan = route.map(|r| r.track());
+        let mut v: Vec<&Activity> = self
+            .activities
+            .iter()
+            .filter(|a| a.sport == sport && a.track.len() >= 10 && a.track.iter().all(|p| p.t.is_some()))
+            .filter(|a| plan.as_ref().is_none_or(|r| follows(r, &a.track)))
+            .collect();
+        if plan.is_some() {
+            v.sort_by(|a, b| a.duration_s.total_cmp(&b.duration_s));
+        } else {
+            // Without a route: the newest ones, most likely the usual rounds.
+            v.sort_by_key(|a| std::cmp::Reverse(a.start));
+        }
+        v
+    }
+
     /// Consecutive days (ending today or yesterday) with at least one activity.
     pub fn streak_days(&self) -> u32 {
         let days: std::collections::HashSet<_> =
@@ -625,6 +643,159 @@ pub fn same_route(a: &Activity, b: &Activity) -> bool {
         let p = &ta[i * (ta.len() - 1) / (samples - 1)];
         tb.iter().step_by(step_b).any(|q| near(p, q, 100.0))
     })
+}
+
+/// Metres along `path` at each of its points.
+pub fn cumulative(path: &[TrackPoint]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(path.len());
+    let mut d = 0.0;
+    for (i, p) in path.iter().enumerate() {
+        if i > 0 {
+            d += haversine(&path[i - 1], p);
+        }
+        out.push(d);
+    }
+    out
+}
+
+/// The point `d` metres along `path` (`cum` from `cumulative`).
+pub fn point_along(path: &[TrackPoint], cum: &[f64], d: f64) -> TrackPoint {
+    let i = cum.partition_point(|&c| c < d).clamp(1, path.len().max(2) - 1);
+    let (a, b) = (&path[i - 1], &path[i.min(path.len() - 1)]);
+    let span = cum[i.min(cum.len() - 1)] - cum[i - 1];
+    let f = if span > 0.0 { ((d - cum[i - 1]) / span).clamp(0.0, 1.0) } else { 0.0 };
+    TrackPoint { lat: a.lat + (b.lat - a.lat) * f, lon: a.lon + (b.lon - a.lon) * f, ele: None, t: None }
+}
+
+/// Where `p` is on `path`: (metres along it, metres away from it). Only the pieces of the path
+/// from 100 m before `from` to `ahead` metres past it count, so a loop's finish is not taken for its start.
+pub fn locate_on(path: &[TrackPoint], cum: &[f64], p: &TrackPoint, from: f64, ahead: f64) -> (f64, f64) {
+    if path.len() < 2 {
+        return (0.0, path.first().map_or(0.0, |q| haversine(q, p)));
+    }
+    // Metres east/north of `p`; flat is close enough over a few kilometres.
+    let k = 111_320.0;
+    let cos = p.lat.to_radians().cos();
+    let xy = |q: &TrackPoint| ((q.lon - p.lon) * k * cos, (q.lat - p.lat) * k);
+    let mut best = (0.0, f64::MAX);
+    for i in 1..path.len() {
+        if cum[i - 1] > from + ahead {
+            break;
+        }
+        if cum[i] < from - 100.0 {
+            continue;
+        }
+        let (ax, ay) = xy(&path[i - 1]);
+        let (bx, by) = xy(&path[i]);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let f = if len2 > 0.0 { (-(ax * dx + ay * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let off = (ax + dx * f).hypot(ay + dy * f);
+        if off < best.1 {
+            best = (cum[i - 1] + (cum[i] - cum[i - 1]) * f, off);
+        }
+    }
+    best
+}
+
+/// True when `track` goes the way of `route`: about as long, same start and finish, and passing along it.
+pub fn follows(route: &[TrackPoint], track: &[TrackPoint]) -> bool {
+    if route.len() < 2 || track.len() < 10 {
+        return false;
+    }
+    let (rc, tc) = (cumulative(route), cumulative(track));
+    let (rl, tl) = (*rc.last().unwrap(), *tc.last().unwrap());
+    // Short routes too (a walk round the block), but not a few taps on the same spot.
+    if rl < 50.0 || (rl - tl).abs() > 0.2 * rl.max(tl).max(50.0) {
+        return false;
+    }
+    // Looser on long routes, tighter on short ones.
+    let (ends, along) = ((rl * 0.3).clamp(30.0, 150.0), (rl * 0.2).clamp(25.0, 100.0));
+    let near = |p: &TrackPoint, q: &TrackPoint| haversine(p, q) <= ends;
+    if !near(&route[0], &track[0]) || !near(route.last().unwrap(), track.last().unwrap()) {
+        return false;
+    }
+    let step = (track.len() / 400).max(1);
+    (0..12).all(|i| {
+        let p = point_along(route, &rc, rl * i as f64 / 11.0);
+        track.iter().step_by(step).any(|q| haversine(&p, q) <= along)
+    })
+}
+
+/// An earlier activity to race against: how far it had gone at each moment of its recording.
+#[derive(Clone, Debug)]
+pub struct Ghost {
+    pub id: u64,
+    pub track: Vec<TrackPoint>,
+    /// Metres along the track, and seconds on its recording clock (counted from 0), per point.
+    pub cum: Vec<f64>,
+    pub times: Vec<f64>,
+}
+
+impl Ghost {
+    /// Needs a track with times; points going back in time are left out.
+    pub fn new(id: u64, track: &[TrackPoint]) -> Option<Ghost> {
+        let mut pts: Vec<TrackPoint> = Vec::with_capacity(track.len());
+        for p in track {
+            let Some(t) = p.t else { continue };
+            if pts.last().and_then(|q| q.t).is_none_or(|last| t > last) {
+                pts.push(*p);
+            }
+        }
+        let t0 = pts.first()?.t?;
+        let times: Vec<f64> = pts.iter().map(|p| p.t.unwrap_or(t0) - t0).collect();
+        let cum = cumulative(&pts);
+        (pts.len() >= 2 && *cum.last()? >= 50.0 && *times.last()? > 0.0).then_some(Ghost { id, track: pts, cum, times })
+    }
+
+    pub fn total_m(&self) -> f64 {
+        *self.cum.last().unwrap_or(&0.0)
+    }
+
+    pub fn total_s(&self) -> f64 {
+        *self.times.last().unwrap_or(&0.0)
+    }
+
+    /// Seconds the ghost needed to cover `d` metres; None past its finish.
+    pub fn time_at(&self, d: f64) -> Option<f64> {
+        if d > self.total_m() {
+            return None;
+        }
+        Some(interp(&self.cum, &self.times, d))
+    }
+
+    /// Metres the ghost had covered after `t` seconds.
+    pub fn dist_at(&self, t: f64) -> f64 {
+        interp(&self.times, &self.cum, t)
+    }
+
+    /// Where the ghost was after `t` seconds.
+    pub fn pos_at(&self, t: f64) -> TrackPoint {
+        point_along(&self.track, &self.cum, self.dist_at(t))
+    }
+
+    /// Seconds behind the ghost (negative: ahead) after `d` metres in `t` seconds.
+    /// Past the ghost's finish, how much earlier or later than the ghost the finish was reached.
+    pub fn gap(&self, d: f64, t: f64) -> f64 {
+        match self.time_at(d) {
+            Some(g) => t - g,
+            None => t - self.total_s(),
+        }
+    }
+}
+
+/// `ys` at `x`, along the rising `xs`, held at the ends.
+fn interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
+    let i = xs.partition_point(|&v| v < x);
+    if i == 0 {
+        return ys.first().copied().unwrap_or(0.0);
+    }
+    if i >= xs.len() {
+        return ys.last().copied().unwrap_or(0.0);
+    }
+    let span = xs[i] - xs[i - 1];
+    let f = if span > 0.0 { (x - xs[i - 1]) / span } else { 1.0 };
+    ys[i - 1] + (ys[i] - ys[i - 1]) * f
 }
 
 pub fn track_stats(track: &[TrackPoint]) -> (f64, f64, f64) {
@@ -892,6 +1063,45 @@ mod tests {
             laps: Vec::new(),
             steps: None,
         }
+    }
+
+    #[test]
+    fn position_on_a_loop_moves_forward_from_the_start() {
+        let a = loop_activity(1, 0.0, 1.0);
+        let cum = cumulative(&a.track);
+        let total = *cum.last().unwrap();
+        // At the start of a loop, the finish is just as close; only looking ahead tells them apart.
+        let (along, off) = locate_on(&a.track, &cum, &a.track[0], 0.0, 300.0);
+        assert!(along < 50.0 && off < 1.0, "{along} {off}");
+        let (along, _) = locate_on(&a.track, &cum, &a.track[100], total - 100.0, 300.0);
+        assert!(along > total - 50.0, "{along}");
+        let (along, off) = locate_on(&a.track, &cum, &a.track[25], 0.0, total);
+        assert!((along - cum[25]).abs() < 5.0 && off < 1.0);
+        let away = TrackPoint { lat: a.track[25].lat + 0.001, lon: a.track[25].lon, ele: None, t: None };
+        assert!(locate_on(&a.track, &cum, &away, 0.0, total).1 > 50.0);
+    }
+
+    #[test]
+    fn ghost_gap_tells_ahead_from_behind() {
+        let a = loop_activity(1, 0.0, 1.0);
+        let g = Ghost::new(a.id, &a.track).unwrap();
+        assert!((g.total_s() - 1000.0).abs() < 1e-6);
+        let half = g.total_m() / 2.0;
+        assert!((g.time_at(half).unwrap() - 500.0).abs() < 5.0);
+        assert!(g.gap(half, 480.0) < -15.0, "faster than the ghost");
+        assert!(g.gap(half, 520.0) > 15.0, "slower than the ghost");
+        assert!((g.dist_at(500.0) - half).abs() < 10.0);
+        assert!(g.gap(g.total_m() + 10.0, 990.0) < 0.0, "finished first");
+        assert!(Ghost::new(9, &a.track[..1]).is_none());
+    }
+
+    #[test]
+    fn a_run_follows_its_planned_route() {
+        let a = loop_activity(1, 0.0, 1.0);
+        let route: Vec<TrackPoint> = a.track.iter().step_by(10).copied().collect();
+        assert!(follows(&route, &loop_activity(2, 30.0, 1.0).track));
+        assert!(!follows(&route, &loop_activity(3, 0.0, 1.6).track));
+        assert!(!follows(&route, &loop_activity(4, 2000.0, 1.0).track));
     }
 
     #[test]
