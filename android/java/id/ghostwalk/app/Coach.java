@@ -27,6 +27,8 @@ public class Coach implements SensorEventListener {
     private static volatile boolean ttsReady;
     /** Said as soon as the voice is ready, if something came up before that. */
     private static String pending;
+    /** The first sentence once the voice is ready: "started", or "continued" after the app was closed. */
+    private static String greeting;
     private static volatile boolean active;
     private static volatile boolean paused;
     private static boolean voice;
@@ -108,14 +110,32 @@ public class Coach implements SensorEventListener {
         reps = repCount;
         tick = 0;
         pending = null;
+        greeting = reps > 0 ? null : "Rekaman dimulai.";
         if (voice) {
-            startVoice(reps > 0 ? null : "Rekaman dimulai.");
+            startVoice();
         }
         ensureSteps();
         Gps.MAIN.postDelayed(PULSE, 1000);
         if (reps > 0) {
             Gps.MAIN.post(TICK);
         }
+    }
+
+    /**
+     * Picks up where a recording was when the app was closed, right after `begin`: the distance and
+     * clock so far, so the notification and the next spoken kilometre carry on instead of starting over.
+     */
+    public static void carryOver(double distM, double elapsedS, double movingS) {
+        long now = System.currentTimeMillis();
+        startMs = now - (long) (elapsedS * 1000);
+        pausedMs = 0;
+        stopped = autoPause ? Math.max(0, elapsedS - movingS) : 0;
+        dist = distM;
+        moving = movingS;
+        kmStartMoving = movingS;
+        nextKm = (int) Math.floor(distM / 1000) + 1;
+        tick = (int) elapsedS;
+        greeting = "Rekaman dilanjutkan.";
     }
 
     public static void setPaused(boolean p) {
@@ -189,7 +209,7 @@ public class Coach implements SensorEventListener {
         }
     }
 
-    private static void startVoice(final String first) {
+    private static void startVoice() {
         try {
             tts = new TextToSpeech(app, new TextToSpeech.OnInitListener() {
                 public void onInit(int status) {
@@ -201,8 +221,8 @@ public class Coach implements SensorEventListener {
                         Log.w(TAG, "no Indonesian voice on this phone; using the default one");
                     }
                     ttsReady = true;
-                    if (first != null) {
-                        say(first);
+                    if (greeting != null) {
+                        say(greeting);
                     }
                     if (pending != null) {
                         say(pending);

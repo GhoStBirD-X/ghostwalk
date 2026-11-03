@@ -127,6 +127,7 @@ impl Recorder {
                 r.sport.min_moving_speed(),
                 r.interval.map(|i| (i.work_s, i.rest_s, i.reps)),
             );
+            crate::android::coach_carry_over(r.distance(), r.elapsed(), r.moving());
             if matches!(r.state, RecState::Paused { .. }) {
                 crate::android::coach_pause(true);
             }
@@ -234,6 +235,11 @@ impl Recorder {
 
     /// Stops GPS and coaching (phones).
     pub fn stop(&mut self) {
+        // Forget "receiving", or the next recording would never ask the phone to start GPS again.
+        if self.gps == 2 {
+            self.gps = 1;
+        }
+        self.gps_asked = None;
         #[cfg(target_os = "android")]
         crate::android::gps_stop();
     }
@@ -279,11 +285,12 @@ impl Recorder {
         #[cfg(target_os = "android")]
         {
             let running = matches!(self.state, RecState::Running { .. });
-            if running && self.gps != 2 {
-                if self.gps_asked.is_none_or(|t| t.elapsed().as_secs() >= 3) {
+            if running {
+                if self.gps != 2 && self.gps_asked.is_none_or(|t| t.elapsed().as_secs() >= 3) {
                     self.gps_asked = Some(Instant::now());
                     crate::android::gps_start();
                 }
+                // Also while receiving, so a lost signal or Location switched off shows up.
                 self.gps = crate::android::gps_state();
             }
             for [lat, lon, ele, acc, ms] in crate::android::gps_drain() {
@@ -604,6 +611,7 @@ impl GhostApp {
     fn finish_recording(&mut self) {
         let total = self.rec.elapsed();
         self.rec.state = RecState::Done { total };
+        self.rec.confirm_discard = false;
         self.rec.stop();
         self.rec.form = self.recording_form();
     }
@@ -674,13 +682,22 @@ impl GhostApp {
                         Err(e) => self.say(e),
                     }
                 }
-                if ui.button(RichText::new("Buang").color(draw::RED)).clicked() {
-                    close = true;
+                let label = if self.rec.confirm_discard { "Ya, buang" } else { "Buang" };
+                if ui.button(RichText::new(label).color(draw::RED)).clicked() {
+                    // Same as while recording: a whole run must not go with one stray tap.
+                    if self.rec.confirm_discard {
+                        close = true;
+                        self.say("Rekaman dibuang");
+                    } else {
+                        self.rec.confirm_discard = true;
+                        self.say("Ketuk sekali lagi untuk membuang rekaman");
+                    }
                 }
             });
         });
         self.rec.form = form;
         if close {
+            self.rec.confirm_discard = false;
             self.rec.state = RecState::Idle;
             self.rec.laps.clear();
             self.rec.track.clear();
@@ -775,5 +792,16 @@ mod tests {
         let m = r.moving();
         assert!((m - 60.0).abs() < 2.0, "moving {m}");
         assert!(r.standing_still());
+    }
+
+    #[test]
+    fn a_new_recording_asks_for_gps_again() {
+        let mut r = Recorder::new(Sport::Run);
+        r.begin(&model::Settings::default());
+        r.gps = 2;
+        r.stop();
+        r.state = RecState::Idle;
+        r.begin(&model::Settings::default());
+        assert_ne!(r.gps, 2, "a stale \"receiving\" would keep GPS off for the next recording");
     }
 }
