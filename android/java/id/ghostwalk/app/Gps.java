@@ -95,6 +95,41 @@ public class Gps implements LocationListener {
         });
     }
 
+    /**
+     * The newest position the phone already knows (lat, lon), without starting GPS or the recording
+     * service; null when there is none yet. Asks for location permission if it is missing.
+     */
+    public static double[] lastKnown(final Activity activity) {
+        if (activity.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED
+                && activity.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            MAIN.post(new Runnable() {
+                public void run() {
+                    try {
+                        activity.requestPermissions(new String[] {
+                            Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION,
+                        }, 8);
+                    } catch (Exception e) {
+                        // Nothing more to do without permission.
+                    }
+                }
+            });
+            return null;
+        }
+        Location best = null;
+        try {
+            LocationManager m = (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
+            for (String provider : m.getProviders(true)) {
+                Location l = m.getLastKnownLocation(provider);
+                if (l != null && (best == null || l.getTime() > best.getTime())) {
+                    best = l;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "last known location failed", e);
+        }
+        return best == null ? null : new double[] {best.getLatitude(), best.getLongitude()};
+    }
+
     public static void stop(final Activity activity) {
         running = false;
         Tracker.stop(activity);

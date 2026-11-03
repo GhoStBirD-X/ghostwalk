@@ -304,6 +304,14 @@ fn line_width(class: Line, zoom: f32) -> f32 {
     (base * 2f32.powf(zoom - 15.0)).clamp(0.6, base * 2.0)
 }
 
+/// The middle of the first installed map, as (latitude, longitude).
+pub fn first_center() -> Option<(f64, f64)> {
+    store().maps.first().map(|m| {
+        let [w, s, e, n] = m.bounds;
+        ((s + n) / 2.0, (w + e) / 2.0)
+    })
+}
+
 /// Draws installed maps under everything else. Returns false when no map covers this view.
 pub fn draw(p: &Painter, rect: Rect, v: &View, dark: bool) -> bool {
     let mut s = store();
@@ -311,8 +319,10 @@ pub fn draw(p: &Painter, rect: Rect, v: &View, dark: bool) -> bool {
         return false;
     }
     let zoom = ((v.s * EARTH_M / 256.0).log2()) as f32;
-    let [w0x, w0y] = v.to_world(rect.min);
-    let [w1x, w1y] = v.to_world(rect.max);
+    // All four corners, since a turned map shows more than the corners of a north-up one.
+    let corners = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()].map(|q| v.to_world(q));
+    let (w0x, w1x) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), q| (a.min(q[0]), b.max(q[0])));
+    let (w0y, w1y) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), q| (a.min(q[1]), b.max(q[1])));
     let lon_lat = |wx: f64, wy: f64| {
         let lon = wx / EARTH_M * 360.0 - 180.0;
         let lat = (std::f64::consts::PI * (1.0 - 2.0 * wy / EARTH_M)).sinh().atan().to_degrees();
@@ -361,7 +371,13 @@ pub fn draw(p: &Painter, rect: Rect, v: &View, dark: bool) -> bool {
     // Sea under each tile; land comes from the "earth" shapes. Outside the map the backdrop stays.
     for (z, x, y, _) in &tiles {
         let to = place(*z, *x, *y);
-        p.rect_filled(Rect::from_min_max(to([0.0, 0.0]), to([1.0, 1.0])), 0.0, pal.sea);
+        let mut sea = egui::Mesh::default();
+        for q in [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]] {
+            sea.colored_vertex(to(q), pal.sea);
+        }
+        sea.add_triangle(0, 1, 2);
+        sea.add_triangle(0, 2, 3);
+        p.add(Shape::mesh(sea));
     }
 
     for class in FILL_ORDER {

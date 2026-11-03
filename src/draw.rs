@@ -647,18 +647,6 @@ pub fn icon(p: &egui::Painter, kind: Icon, c: Pos2, color: Color32) {
 
 // ---------- maps ----------
 
-/// Flat metres (x east, y south) from lat/lon.
-pub fn project(track: &[TrackPoint]) -> Vec<[f64; 2]> {
-    let Some(first) = track.first() else {
-        return Vec::new();
-    };
-    let k = first.lat.to_radians().cos();
-    track
-        .iter()
-        .map(|p| [p.lon * 111_320.0 * k, -p.lat * 111_320.0])
-        .collect()
-}
-
 pub fn map_backdrop(ui: &Ui, p: &egui::Painter, rect: Rect, radius: f32) {
     p.rect_filled(rect, radius, map_bg(ui));
     let line = pick(ui, Color32::from_rgb(34, 35, 40), Color32::from_rgb(220, 228, 216));
@@ -718,21 +706,36 @@ pub fn merc(track: &[TrackPoint]) -> Vec<[f64; 2]> {
         .collect()
 }
 
-/// Where map positions land on screen: `screen = world * s + offset`.
+/// Latitude and longitude for a position in Web Mercator metres (the reverse of `merc`).
+pub fn unmerc(p: [f64; 2]) -> (f64, f64) {
+    let lon = p[0] / EARTH_M * 360.0 - 180.0;
+    let lat = (std::f64::consts::PI * (1.0 - 2.0 * p[1] / EARTH_M)).sinh().atan().to_degrees();
+    (lat, lon)
+}
+
+/// Where map positions land on screen: `world * s + offset`, then turned by `rot`
+/// (radians, clockwise on screen) around the map's centre `c`.
 #[derive(Clone, Copy, Debug)]
 pub struct View {
     pub s: f64,
     pub ox: f64,
     pub oy: f64,
+    pub rot: f64,
+    pub c: [f64; 2],
 }
 
 impl View {
     pub fn to_screen(&self, p: [f64; 2]) -> Pos2 {
-        pos2((p[0] * self.s + self.ox) as f32, (p[1] * self.s + self.oy) as f32)
+        let (x, y) = (p[0] * self.s + self.ox - self.c[0], p[1] * self.s + self.oy - self.c[1]);
+        let (sin, cos) = self.rot.sin_cos();
+        pos2((self.c[0] + x * cos - y * sin) as f32, (self.c[1] + x * sin + y * cos) as f32)
     }
 
     pub fn to_world(&self, p: Pos2) -> [f64; 2] {
-        [(p.x as f64 - self.ox) / self.s, (p.y as f64 - self.oy) / self.s]
+        let (x, y) = (p.x as f64 - self.c[0], p.y as f64 - self.c[1]);
+        let (sin, cos) = self.rot.sin_cos();
+        let (ux, uy) = (self.c[0] + x * cos + y * sin, self.c[1] - x * sin + y * cos);
+        [(ux - self.ox) / self.s, (uy - self.oy) / self.s]
     }
 }
 
@@ -741,7 +744,7 @@ pub fn fit(paths: &[&[[f64; 2]]], rect: Rect, pad: f32) -> impl Fn([f64; 2]) -> 
     move |p: [f64; 2]| v.to_screen(p)
 }
 
-/// The view that shows every path inside `rect`.
+/// The north-up view that shows every path inside `rect`.
 pub fn fit_view(paths: &[&[[f64; 2]]], rect: Rect, pad: f32) -> View {
     let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for path in paths {
@@ -758,55 +761,100 @@ pub fn fit_view(paths: &[&[[f64; 2]]], rect: Rect, pad: f32) -> View {
     let s = (inner.width() as f64 / w).min(inner.height() as f64 / h);
     let ox = inner.center().x as f64 - (minx + w / 2.0) * s;
     let oy = inner.center().y as f64 - (miny + h / 2.0) * s;
-    View { s, ox, oy }
+    View { s, ox, oy, rot: 0.0, c: [rect.center().x as f64, rect.center().y as f64] }
 }
 
-/// Applies dragging, pinching and the +/- buttons to `base`; the zoom is remembered per map.
-fn pan_zoom(ui: &Ui, resp: &egui::Response, rect: Rect, base: View) -> View {
+/// A north-up view with `center` (Web Mercator metres) in the middle and about `span_m` real metres across.
+pub fn centered_view(center: [f64; 2], span_m: f64, rect: Rect) -> View {
+    let (lat, _) = unmerc(center);
+    // Mercator stretches distances by 1 / cos(latitude).
+    let s = rect.width() as f64 / (span_m / lat.to_radians().cos().max(0.01));
+    let c = [rect.center().x as f64, rect.center().y as f64];
+    View { s, ox: c[0] - center[0] * s, oy: c[1] - center[1] * s, rot: 0.0, c }
+}
+
+/// `v` turned by `a` radians (clockwise on screen).
+fn turn(v: Vec2, a: f64) -> Vec2 {
+    let (sin, cos) = (a as f32).sin_cos();
+    vec2(v.x * cos - v.y * sin, v.x * sin + v.y * cos)
+}
+
+/// Where the compass sits on a map that is turned away from north.
+fn compass_at(rect: Rect) -> Pos2 {
+    pos2(rect.left() + 22.0, rect.top() + 22.0)
+}
+
+/// Applies dragging, pinching, turning and the corner buttons to `base` (a north-up view);
+/// zoom, pan and turn are remembered per map.
+/// Phones turn with two fingers, computers with a right-button drag.
+fn pan_zoom(ui: &Ui, resp: &egui::Response, rect: Rect, base: View, double_click_resets: bool) -> View {
     let id = resp.id.with("pan_zoom");
-    let (mut zoom, mut pan): (f64, Vec2) = ui.data(|d| d.get_temp(id)).unwrap_or((1.0, Vec2::ZERO));
+    let (mut zoom, mut pan, mut rot): (f64, Vec2, f64) = ui.data(|d| d.get_temp(id)).unwrap_or((1.0, Vec2::ZERO, 0.0));
     let c = rect.center();
+    // Panning and zooming happen before the turn, so screen positions are turned back first.
+    let unturn = |at: Pos2, rot: f64| c + turn(at - c, -rot);
     let zoom_at = |zoom: &mut f64, pan: &mut Vec2, factor: f64, at: Pos2| {
         let z2 = (*zoom * factor).clamp(0.25, 64.0);
         *pan = (at - c) - (at - c - *pan) * (z2 / *zoom) as f32;
         *zoom = z2;
     };
-    if resp.dragged() {
-        pan += resp.drag_delta();
+    // Turns the map by `d`, keeping the place under `at` where it is.
+    let turn_at = |pan: &mut Vec2, rot: &mut f64, d: f64, at: Pos2| {
+        let r2 = *rot + d;
+        *pan += turn(at - c, -r2) - turn(at - c, -*rot);
+        *rot = r2;
+    };
+    if resp.dragged_by(egui::PointerButton::Secondary) {
+        turn_at(&mut pan, &mut rot, resp.drag_delta().x as f64 * 0.01, c);
+    } else if resp.dragged() {
+        pan += turn(resp.drag_delta(), -rot);
     }
     if resp.hovered() {
         let zd = ui.input(|i| i.zoom_delta()) as f64;
         if zd != 1.0 {
             let at = ui.input(|i| i.pointer.hover_pos()).unwrap_or(c);
-            zoom_at(&mut zoom, &mut pan, zd, at);
+            zoom_at(&mut zoom, &mut pan, zd, unturn(at, rot));
         }
     }
-    if resp.double_clicked() {
-        (zoom, pan) = (1.0, Vec2::ZERO);
+    if let Some(mt) = ui.input(|i| i.multi_touch()) {
+        if rect.contains(mt.center_pos) && mt.rotation_delta != 0.0 {
+            turn_at(&mut pan, &mut rot, mt.rotation_delta as f64, mt.center_pos);
+        }
+    }
+    rot = (rot + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
+    if double_click_resets && resp.double_clicked() {
+        (zoom, pan, rot) = (1.0, Vec2::ZERO, 0.0);
     }
     for (i, factor) in [(0, 2.0), (1, 0.5), (2, 0.0)] {
-        if i == 2 && zoom == 1.0 && pan == Vec2::ZERO {
+        if i == 2 && zoom == 1.0 && pan == Vec2::ZERO && rot == 0.0 {
             continue;
         }
         let r = Rect::from_center_size(pos2(rect.right() - 22.0, rect.top() + 22.0 + i as f32 * 36.0), Vec2::splat(30.0));
         if ui.interact(r, id.with(i), Sense::click()).clicked() {
             if factor == 0.0 {
-                (zoom, pan) = (1.0, Vec2::ZERO);
+                (zoom, pan, rot) = (1.0, Vec2::ZERO, 0.0);
             } else {
                 zoom_at(&mut zoom, &mut pan, factor, c);
             }
         }
     }
-    ui.data_mut(|d| d.insert_temp(id, (zoom, pan)));
+    // Back to north up, turning around the centre so the middle of the map stays put.
+    if rot != 0.0 && ui.interact(Rect::from_center_size(compass_at(rect), Vec2::splat(30.0)), id.with("north"), Sense::click()).clicked() {
+        rot = 0.0;
+    }
+    ui.data_mut(|d| d.insert_temp(id, (zoom, pan, rot)));
     View {
         s: base.s * zoom,
         ox: c.x as f64 + (base.ox - c.x as f64) * zoom + pan.x as f64,
         oy: c.y as f64 + (base.oy - c.y as f64) * zoom + pan.y as f64,
+        rot,
+        c: [c.x as f64, c.y as f64],
     }
 }
 
-/// Zoom in, zoom out and (once moved) back-to-route buttons in the map's corner.
-fn zoom_buttons(ui: &Ui, p: &egui::Painter, rect: Rect, show_reset: bool) {
+/// Zoom in, zoom out and (once moved) back-to-start buttons in the map's corner,
+/// and a compass pointing north while the map is turned.
+fn zoom_buttons(ui: &Ui, p: &egui::Painter, rect: Rect, show_reset: bool, rot: f64) {
     let fg = strong(ui);
     for i in 0..if show_reset { 3 } else { 2 } {
         let c = pos2(rect.right() - 22.0, rect.top() + 22.0 + i as f32 * 36.0);
@@ -826,10 +874,18 @@ fn zoom_buttons(ui: &Ui, p: &egui::Painter, rect: Rect, show_reset: bool) {
             }
         }
     }
+    if rot != 0.0 {
+        let c = compass_at(rect);
+        p.circle(c, 15.0, card_bg(ui).gamma_multiply(0.92), Stroke::new(1.0, border(ui)));
+        let north = turn(vec2(0.0, -10.0), rot);
+        let side = turn(vec2(4.0, 0.0), rot);
+        p.add(egui::Shape::convex_polygon(vec![c + north, c + side, c - side], RED, Stroke::NONE));
+        p.add(egui::Shape::convex_polygon(vec![c - north, c - side, c + side], muted(ui), Stroke::NONE));
+    }
 }
 
 /// A route over the offline map (or the plain backdrop where there is none).
-/// `interactive` maps can be dragged and zoomed.
+/// `interactive` maps can be dragged, zoomed and turned.
 /// `around` is the colour behind the map, used to round its corners.
 pub fn route_map(ui: &mut Ui, track: &[TrackPoint], color: Color32, height: f32, interactive: bool, around: Color32) -> egui::Response {
     let sense = if interactive { Sense::click_and_drag() } else { Sense::click() };
@@ -842,7 +898,7 @@ pub fn route_map(ui: &mut Ui, track: &[TrackPoint], color: Color32, height: f32,
         return resp;
     }
     let base = fit_view(&[&pts], rect, 18.0);
-    let view = if interactive { pan_zoom(ui, &resp, rect, base) } else { base };
+    let view = if interactive { pan_zoom(ui, &resp, rect, base, true) } else { base };
     let dark = ui.visuals().dark_mode;
     let has_map = crate::offmap::draw(&p, rect, &view, dark);
     let line: Vec<Pos2> = pts.iter().map(|q| view.to_screen(*q)).collect();
@@ -863,10 +919,66 @@ pub fn route_map(ui: &mut Ui, track: &[TrackPoint], color: Color32, height: f32,
     }
     round_corners(&p, rect, 14.0, around);
     if interactive {
-        let moved = view.s != base.s || view.ox != base.ox || view.oy != base.oy;
-        zoom_buttons(ui, &p, rect, moved);
+        let moved = view.s != base.s || view.ox != base.ox || view.oy != base.oy || view.rot != 0.0;
+        zoom_buttons(ui, &p, rect, moved, view.rot);
     }
     resp
+}
+
+/// The route planner's map: the offline map around `center` (latitude, longitude), about 4 km
+/// across, with the route drawn so far. Returns where it was tapped, as (latitude, longitude).
+pub fn plan_map(ui: &mut Ui, center: (f64, f64), route: &[[f64; 2]], color: Color32, around: Color32) -> Option<(f64, f64)> {
+    let side = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click_and_drag());
+    // A new starting place: start again from a plain north-up view there.
+    let key = resp.id.with("plan_center");
+    ui.data_mut(|d| {
+        if d.get_temp::<(f64, f64)>(key) != Some(center) {
+            d.remove::<(f64, Vec2, f64)>(resp.id.with("pan_zoom"));
+            d.insert_temp(key, center);
+        }
+    });
+    let p = ui.painter_at(rect);
+    map_backdrop(ui, &p, rect, 10.0);
+    let m = merc01(center.0, center.1);
+    let base = centered_view([m[0] * EARTH_M, m[1] * EARTH_M], 4000.0, rect);
+    // Taps add points, so a double tap must not also reset the view.
+    let view = pan_zoom(ui, &resp, rect, base, false);
+    let dark = ui.visuals().dark_mode;
+    let has_map = crate::offmap::draw(&p, rect, &view, dark);
+    let line: Vec<Pos2> = route
+        .iter()
+        .map(|q| {
+            let w = merc01(q[0], q[1]);
+            view.to_screen([w[0] * EARTH_M, w[1] * EARTH_M])
+        })
+        .collect();
+    if line.len() > 1 {
+        p.line(line.clone(), Stroke::new(4.0, color));
+    }
+    for (i, q) in line.iter().enumerate() {
+        let c = if i == 0 { GREEN } else { Color32::WHITE };
+        p.circle(*q, 5.0, c, Stroke::new(2.0, color));
+    }
+    if has_map {
+        crate::offmap::attribution(&p, rect, dark);
+    } else {
+        p.text(
+            rect.left_bottom() + vec2(8.0, -6.0),
+            Align2::LEFT_BOTTOM,
+            "Belum ada peta offline untuk area ini",
+            FontId::proportional(11.0),
+            muted(ui),
+        );
+    }
+    round_corners(&p, rect, 14.0, around);
+    let moved = view.s != base.s || view.ox != base.ox || view.oy != base.oy || view.rot != 0.0;
+    zoom_buttons(ui, &p, rect, moved, view.rot);
+    if resp.clicked() {
+        resp.interact_pointer_pos().map(|pos| unmerc(view.to_world(pos)))
+    } else {
+        None
+    }
 }
 
 // ---------- charts ----------
@@ -955,5 +1067,43 @@ pub fn progress(ui: &mut Ui, frac: f32, color: Color32) {
     done.set_width((rect.width() * frac.clamp(0.0, 1.0)).max(10.0));
     if frac > 0.0 {
         p.rect_filled(done, 5.0, color);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_turned_view_maps_back_to_the_same_place() {
+        let v = View { s: 0.37, ox: 120.0, oy: -40.0, rot: 1.1, c: [200.0, 150.0] };
+        for p in [[0.0, 0.0], [512.5, -88.0], [-3000.0, 1234.5]] {
+            let back = v.to_world(v.to_screen(p));
+            assert!((back[0] - p[0]).abs() < 0.01 && (back[1] - p[1]).abs() < 0.01, "{p:?} came back as {back:?}");
+        }
+        // A quarter turn clockwise: what was east of the centre is now below it.
+        let q = View { s: 1.0, ox: 0.0, oy: 0.0, rot: std::f64::consts::FRAC_PI_2, c: [0.0, 0.0] }.to_screen([10.0, 0.0]);
+        assert!(q.x.abs() < 1e-4 && (q.y - 10.0).abs() < 1e-4, "{q:?}");
+    }
+
+    #[test]
+    fn mercator_round_trip() {
+        let m = merc01(-6.2383, 106.9756);
+        let (lat, lon) = unmerc([m[0] * EARTH_M, m[1] * EARTH_M]);
+        assert!((lat + 6.2383).abs() < 1e-9 && (lon - 106.9756).abs() < 1e-9);
+    }
+
+    #[test]
+    fn centered_view_spans_the_asked_distance() {
+        let m = merc01(-6.2, 106.8);
+        let c = [m[0] * EARTH_M, m[1] * EARTH_M];
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 400.0));
+        let v = centered_view(c, 4000.0, rect);
+        let (la, lo) = unmerc(v.to_world(pos2(0.0, 200.0)));
+        let (lb, lb2) = unmerc(v.to_world(pos2(400.0, 200.0)));
+        let a = TrackPoint { lat: la, lon: lo, ele: None, t: None };
+        let b = TrackPoint { lat: lb, lon: lb2, ele: None, t: None };
+        let d = crate::model::haversine(&a, &b);
+        assert!((d - 4000.0).abs() < 20.0, "{d}");
     }
 }

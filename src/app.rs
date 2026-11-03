@@ -181,7 +181,12 @@ pub struct GhostApp {
     pub toast: Option<(String, f64)>,
     pub feed_filter: Option<Sport>,
     pub map_mode: MapMode,
-    pub draft: Vec<[f32; 2]>,
+    /// The route being drawn, as [latitude, longitude] points.
+    pub draft: Vec<[f64; 2]>,
+    /// Where the route planner's map is centred, once chosen (latitude, longitude).
+    pub plan_center: Option<(f64, f64)>,
+    /// Place name or coordinates typed in the route planner.
+    pub plan_search: String,
     pub draft_name: String,
     pub draft_sport: Sport,
     pub goal_draft: model::Goal,
@@ -276,6 +281,8 @@ impl GhostApp {
             feed_filter: None,
             map_mode: MapMode::Routes,
             draft: Vec::new(),
+            plan_center: None,
+            plan_search: String::new(),
             draft_name: String::new(),
             draft_sport: Sport::Run,
             goal_draft: model::Goal {
@@ -1103,16 +1110,21 @@ impl GhostApp {
                 }
             }
             if a.track.len() > 1 && ui.button("Jadikan rute").clicked() {
-                let pts = draw::project(&a.track);
-                let (x0, y0) = (pts[0][0], pts[0][1]);
-                let step = (pts.len() / 60).max(1);
-                let points = pts.iter().step_by(step).map(|p| [(p[0] - x0) as f32, (p[1] - y0) as f32]).collect();
+                // Keeps where the route really is, thinned to about 200 points, always with the finish.
+                let step = (a.track.len() / 200).max(1);
+                let mut geo: Vec<[f64; 2]> = a.track.iter().step_by(step).map(|p| [p.lat, p.lon]).collect();
+                if let Some(last) = a.track.last() {
+                    if geo.last() != Some(&[last.lat, last.lon]) {
+                        geo.push([last.lat, last.lon]);
+                    }
+                }
                 let rid = self.data.new_id();
                 self.data.routes.push(model::Route {
                     id: rid,
                     name: format!("Rute: {}", a.title),
                     sport: a.sport,
-                    points,
+                    points: Vec::new(),
+                    geo,
                 });
                 self.save();
                 self.say("Rute disimpan di Peta");

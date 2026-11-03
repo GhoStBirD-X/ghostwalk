@@ -132,6 +132,24 @@ pub fn gps_drain() -> Vec<[f64; 5]> {
     .unwrap_or_default()
 }
 
+/// The newest position the phone already knows (latitude, longitude), without starting GPS.
+/// None when there is none yet or location is not allowed (then the phone asks).
+pub fn last_location() -> Option<(f64, f64)> {
+    with_gps(|env, cls, act| {
+        let arr = env
+            .call_static_method(cls, "lastKnown", "(Landroid/app/Activity;)[D", &[JValue::Object(act)])?
+            .l()?;
+        if arr.is_null() {
+            return Ok(None);
+        }
+        let arr = JDoubleArray::from(arr);
+        let mut b = [0.0; 2];
+        env.get_double_array_region(&arr, 0, &mut b)?;
+        Ok(Some((b[0], b[1])))
+    })
+    .flatten()
+}
+
 /// Draws the app behind the status and navigation bars, with bar icons matching the theme.
 pub fn edge_to_edge(dark: bool) {
     with_class("id.ghostwalk.app.Screen", |env, cls, act| {

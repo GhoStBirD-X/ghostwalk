@@ -9,9 +9,6 @@ use crate::model::{self, Gear, Metric, Period, Route, Sport};
 use chrono::{Datelike, Local, NaiveDate, Timelike};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, RichText, Sense, Stroke, Ui, pos2, vec2};
 
-/// Width and height of the route planner area, in metres.
-const PLAN_SPAN_M: f32 = 4000.0;
-
 impl GhostApp {
     // ---------- maps ----------
 
@@ -52,15 +49,22 @@ impl GhostApp {
                     draw::sport_badge(ui, r.sport, 28.0);
                     ui.label(RichText::new(&r.name).size(15.0).family(draw::semi()).color(draw::strong(ui)));
                 });
-                let pts: Vec<[f64; 2]> = r.points.iter().map(|p| [p[0] as f64, p[1] as f64]).collect();
-                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 130.0), Sense::hover());
-                let p = ui.painter_at(rect);
-                draw::map_backdrop(ui, &p, rect, 10.0);
-                if pts.len() > 1 {
-                    let f = draw::fit(&[&pts], rect, 16.0);
-                    let line: Vec<Pos2> = pts.iter().map(|q| f(*q)).collect();
-                    p.line(line.clone(), Stroke::new(3.0, draw::sport_color(r.sport)));
-                    p.circle_filled(line[0], 4.5, draw::GREEN);
+                if !r.geo.is_empty() {
+                    let around = draw::card_bg(ui);
+                    draw::route_map(ui, &r.track(), draw::sport_color(r.sport), 150.0, false, around);
+                } else {
+                    // Routes from before they had a place: only their shape is known.
+                    let pts: Vec<[f64; 2]> = r.points.iter().map(|p| [p[0] as f64, p[1] as f64]).collect();
+                    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 130.0), Sense::hover());
+                    let p = ui.painter_at(rect);
+                    draw::map_backdrop(ui, &p, rect, 10.0);
+                    if pts.len() > 1 {
+                        let f = draw::fit(&[&pts], rect, 16.0);
+                        let line: Vec<Pos2> = pts.iter().map(|q| f(*q)).collect();
+                        p.line(line.clone(), Stroke::new(3.0, draw::sport_color(r.sport)));
+                        p.circle_filled(line[0], 4.5, draw::GREEN);
+                    }
+                    ui.label(RichText::new("Rute lama: belum punya lokasi di peta.").size(11.5).color(draw::muted(ui)));
                 }
                 let d = r.distance_m();
                 let speed = self.avg_speed(r.sport);
@@ -103,45 +107,89 @@ impl GhostApp {
         }
     }
 
+    /// Where the route planner starts: the place chosen, the route so far, the latest activity,
+    /// an installed map, or else central Jakarta.
+    fn plan_start(&self) -> (f64, f64) {
+        self.plan_center
+            .or_else(|| self.draft.first().map(|p| (p[0], p[1])))
+            .or_else(|| self.data.activities.iter().find_map(|a| a.track.first().map(|p| (p.lat, p.lon))))
+            .or_else(offmap::first_center)
+            .unwrap_or((-6.1754, 106.8272))
+    }
+
+    /// Moves the planner's map to `at`; with no points yet, `at` also becomes the start.
+    fn plan_go(&mut self, at: (f64, f64), as_start: bool) {
+        self.plan_center = Some(at);
+        if as_start && self.draft.is_empty() {
+            self.draft.push([at.0, at.1]);
+        }
+    }
+
     fn route_planner(&mut self, ui: &mut Ui) {
         let imp = self.data.settings.imperial;
         draw::card(ui, |ui| {
-            ui.label(
-                RichText::new("Ketuk peta untuk menambah titik. Satu kotak = 500 m.")
-                    .size(12.0)
-                    .color(draw::muted(ui)),
-            );
-            let side = ui.available_width();
-            let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click());
-            let p = ui.painter_at(rect);
-            draw::map_backdrop(ui, &p, rect, 10.0);
-            let scale = side / PLAN_SPAN_M;
-            for i in 1..8 {
-                let x = rect.left() + i as f32 * 500.0 * scale;
-                let y = rect.top() + i as f32 * 500.0 * scale;
-                let c = draw::border(ui);
-                p.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(0.5, c));
-                p.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(0.5, c));
-            }
-            if resp.clicked() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    self.draft.push([(pos.x - rect.left()) / scale, (pos.y - rect.top()) / scale]);
+            ui.label(RichText::new("Mulai dari mana?").size(14.0).family(draw::semi()).color(draw::strong(ui)));
+            #[cfg(target_os = "android")]
+            if ui.button("Lokasi saya").clicked() {
+                // While recording the newest GPS point is best; otherwise what the phone last knew.
+                let here = self
+                    .rec
+                    .track
+                    .last()
+                    .map(|p| (p.lat, p.lon))
+                    .or_else(crate::android::last_location);
+                match here {
+                    Some(at) => self.plan_go(at, true),
+                    None => self.say("Lokasi belum diketahui. Izinkan dan nyalakan Lokasi, lalu coba lagi."),
                 }
             }
-            let to_screen = |q: &[f32; 2]| pos2(rect.left() + q[0] * scale, rect.top() + q[1] * scale);
-            let line: Vec<Pos2> = self.draft.iter().map(to_screen).collect();
-            if line.len() > 1 {
-                p.line(line.clone(), Stroke::new(4.0, draw::sport_color(self.draft_sport)));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.plan_search)
+                    .hint_text("Cari kecamatan/kota, atau koordinat -6.24, 106.99")
+                    .desired_width(f32::INFINITY),
+            );
+            let mut go = None;
+            if let Some(at) = mapdl::parse_coords(&self.plan_search) {
+                if ui.button(format!("Mulai di {:.5}, {:.5}", at.0, at.1)).clicked() {
+                    go = Some((at, true));
+                }
+            } else {
+                for place in mapdl::search(&self.plan_search, 5) {
+                    let text = format!("{} · {}", place.name, place.context);
+                    if ui.button(RichText::new(text).size(12.5)).clicked() {
+                        // A place name only says roughly where, so it moves the map but sets no start.
+                        go = Some(((place.lat, place.lon), false));
+                    }
+                }
             }
-            for (i, q) in line.iter().enumerate() {
-                let c = if i == 0 { draw::GREEN } else { Color32::WHITE };
-                p.circle(*q, 5.0, c, Stroke::new(2.0, draw::sport_color(self.draft_sport)));
+            if let Some((at, as_start)) = go {
+                self.plan_go(at, as_start);
+                self.plan_search.clear();
+            }
+            ui.add_space(4.0);
+            let turn_hint = if cfg!(target_os = "android") { "putar dengan dua jari" } else { "klik kanan + seret untuk memutar" };
+            ui.label(
+                RichText::new(format!(
+                    "Ketuk peta untuk menambah titik; titik hijau adalah start. Geser dan zoom untuk melihat sekitar, {turn_hint}."
+                ))
+                .size(12.0)
+                .color(draw::muted(ui)),
+            );
+            let center = self.plan_start();
+            let around = draw::card_bg(ui);
+            if let Some(at) = draw::plan_map(ui, center, &self.draft, draw::sport_color(self.draft_sport), around) {
+                if self.plan_center.is_none() {
+                    // Keep the map where it is now that the route has started.
+                    self.plan_center = Some(center);
+                }
+                self.draft.push([at.0, at.1]);
             }
             let d = Route {
                 id: 0,
                 name: String::new(),
                 sport: self.draft_sport,
-                points: self.draft.clone(),
+                points: Vec::new(),
+                geo: self.draft.clone(),
             }
             .distance_m();
             ui.horizontal(|ui| {
@@ -183,7 +231,8 @@ impl GhostApp {
                         id,
                         name,
                         sport: self.draft_sport,
-                        points: std::mem::take(&mut self.draft),
+                        points: Vec::new(),
+                        geo: std::mem::take(&mut self.draft),
                     });
                     self.draft_name.clear();
                     self.save();

@@ -292,17 +292,40 @@ pub struct Route {
     pub id: u64,
     pub name: String,
     pub sport: Sport,
-    /// Points in metres on a local flat plane.
+    /// Older routes only: points in metres on a local flat plane, with no place on the map.
+    #[serde(default)]
     pub points: Vec<[f32; 2]>,
+    /// Points as [latitude, longitude]. Empty for older routes.
+    #[serde(default)]
+    pub geo: Vec<[f64; 2]>,
 }
 
 impl Route {
     pub fn distance_m(&self) -> f64 {
+        if !self.geo.is_empty() {
+            return self.track().windows(2).map(|w| haversine(&w[0], &w[1])).sum();
+        }
         self.points
             .windows(2)
             .map(|w| ((w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])) as f64)
             .sum()
     }
+
+    /// The route's points as a track (no times), for drawing on the map.
+    pub fn track(&self) -> Vec<TrackPoint> {
+        self.geo.iter().map(|g| TrackPoint { lat: g[0], lon: g[1], ele: None, t: None }).collect()
+    }
+}
+
+/// Flat points in metres (x east, y south) placed on the map with the first point at `origin` (latitude, longitude).
+pub fn flat_to_geo(points: &[[f32; 2]], origin: (f64, f64)) -> Vec<[f64; 2]> {
+    let k = 111_320.0;
+    let cos = origin.0.to_radians().cos().max(0.01);
+    let (x0, y0) = points.first().map_or((0.0, 0.0), |p| (p[0] as f64, p[1] as f64));
+    points
+        .iter()
+        .map(|p| [origin.0 - (p[1] as f64 - y0) / k, origin.1 + (p[0] as f64 - x0) / (k * cos)])
+        .collect()
 }
 
 /// Run/rest blocks, e.g. 1 minute running and 1 minute walking, 8 times.
@@ -828,14 +851,11 @@ pub fn sample_data() -> Data {
         id: r,
         name: "Putaran taman kota".into(),
         sport: Sport::Run,
-        points: vec![
-            [0.0, 0.0],
-            [900.0, 150.0],
-            [1500.0, 900.0],
-            [1100.0, 1700.0],
-            [200.0, 1500.0],
-            [0.0, 0.0],
-        ],
+        points: Vec::new(),
+        geo: flat_to_geo(
+            &[[0.0, 0.0], [900.0, 150.0], [1500.0, 900.0], [1100.0, 1700.0], [200.0, 1500.0], [0.0, 0.0]],
+            (-6.195, 106.822),
+        ),
     });
     d.sort();
     d.sample_ids = (1..=d.next_id).collect();
@@ -899,6 +919,20 @@ mod tests {
         assert_eq!(d.activities[0].gear, None, "sample gear is gone, so the link is cleared");
         assert_eq!(d.gear.len(), 1);
         assert!(d.goals.is_empty() && d.routes.is_empty() && !d.has_samples);
+    }
+
+    #[test]
+    fn routes_on_the_map_measure_real_distance() {
+        let flat = [[0.0, 0.0], [1000.0, 0.0], [1000.0, 1000.0]];
+        let old = Route { id: 1, name: String::new(), sport: Sport::Run, points: flat.to_vec(), geo: Vec::new() };
+        let new = Route { geo: flat_to_geo(&flat, (-6.2, 106.8)), points: Vec::new(), ..old.clone() };
+        assert!((old.distance_m() - 2000.0).abs() < 0.1);
+        assert!((new.distance_m() - 2000.0).abs() < 5.0, "{}", new.distance_m());
+        // East is +longitude and south (y down) is -latitude.
+        assert!(new.geo[1][1] > new.geo[0][1] && new.geo[2][0] < new.geo[1][0]);
+        let json = r#"{"id":3,"name":"lama","sport":"Run","points":[[0.0,0.0],[3.0,4.0]]}"#;
+        let r: Route = serde_json::from_str(json).unwrap();
+        assert!(r.geo.is_empty() && (r.distance_m() - 5.0).abs() < 1e-6, "older routes still load");
     }
 
     #[test]
