@@ -14,13 +14,15 @@ Pencatat olahraga yang **pribadi dan offline** untuk Android dan komputer (Linux
 - **Rute**: buat rute sendiri, lalu lari mengikutinya: rute tampil di peta saat merekam, dengan sisa jarak dan peringatan (suara dan getar) saat keluar rute. Peta jejak semua aktivitas.
 - **Lawan hantu**: berlomba dengan lari Anda sebelumnya. Titik hantu bergerak di peta, selisih detik terlihat setiap saat, dan di setiap km terdengar apakah Anda di depan atau di belakang hantu, juga saat layar mati.
 - **Data milik Anda**: ekspor GPX dan CSV, cadangkan dan pulihkan dalam JSON.
+- **Fitur pilihan** (mati sampai dinyalakan di Pengaturan): tema peta (Neon Malam, Peta Harta, Piksel, Radar, Salju), panduan belokan saat mengikuti rute ("Dalam 100 meter, belok kiri"), dan update di dalam app yang memeriksa SHA-256, nama paket, dan tanda tangan sebelum memasang.
 - Tema gelap dan terang, bahasa Indonesia.
 
 ## Privasi
 
 - Tidak perlu akun, email, nomor HP, atau tanggal lahir.
 - Internet **hanya** dipakai saat Anda menekan tombol unduh peta. Yang diminta hanyalah potongan peta untuk wilayah yang Anda pilih sendiri dari daftar; lokasi GPS, rute, dan aktivitas tidak pernah dikirim ke mana pun.
-- Izin Android yang dipakai: lokasi (merekam rute), notifikasi dan layanan latar depan (rekam saat layar mati), aktivitas fisik (hitung langkah), getar (penanda interval), dan internet (unduh peta).
+- Bila fitur pilihan "Update di dalam app" Anda nyalakan, app juga meminta info rilis terbaru dari GitHub (tanpa data Anda) dan mengunduh APK-nya bila Anda setujui.
+- Izin Android yang dipakai: lokasi (merekam rute), notifikasi dan layanan latar depan (rekam saat layar mati), aktivitas fisik (hitung langkah), getar (penanda interval), dan internet (unduh peta, dan cek update bila dinyalakan), serta pasang app (hanya untuk update yang Anda setujui).
 
 ## Install di Android
 

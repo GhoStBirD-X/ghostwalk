@@ -12,6 +12,7 @@ mod pmtiles;
 mod record;
 mod screens;
 mod summary;
+mod update;
 
 #[cfg(target_os = "android")]
 pub mod android;

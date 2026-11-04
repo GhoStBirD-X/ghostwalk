@@ -204,6 +204,10 @@ pub struct GhostApp {
     pub map_delete: Option<PathBuf>,
     /// Shown once after the app closed by itself.
     pub crash_report: Option<String>,
+    /// The optional update check, while it runs or has something to show.
+    pub update_task: Option<crate::update::Task>,
+    /// What changed, shown once after an update: (version, notes).
+    pub whats_new: Option<(String, String)>,
     /// A card with confetti for records set by the activity just saved.
     pub celebrate: Option<(Vec<String>, Instant)>,
     /// The last deleted activity, while it can still be brought back.
@@ -305,6 +309,8 @@ impl GhostApp {
             map_import: String::new(),
             map_delete: None,
             crash_report,
+            update_task: None,
+            whats_new: None,
             picking: None,
             celebrate: None,
             undo: None,
@@ -327,9 +333,10 @@ impl GhostApp {
             // A finished recording that was not saved yet when the app closed.
             app.rec.form = app.recording_form();
         }
+        app.after_update(&cc.egui_ctx);
         app.rec.arm(&app.data);
         if app.rec.active() {
-            app.rec.send_plan();
+            app.rec.send_plan(app.data.settings.opt_turn_cues);
         }
         app
     }
@@ -352,6 +359,12 @@ impl GhostApp {
             "settings" => (self.tab, self.sub) = (Tab::You, Some(Sub::Settings)),
             "summary" => (self.tab, self.sub) = (Tab::You, Some(Sub::Summary)),
             "onboarding" => self.data.settings.onboarded = false,
+            "features" => {
+                // The settings with every optional feature switched on.
+                (self.tab, self.sub) = (Tab::You, Some(Sub::Settings));
+                let st = &mut self.data.settings;
+                (st.opt_themes, st.opt_turn_cues, st.opt_updates, st.map_theme) = (true, true, true, model::MapTheme::Treasure);
+            }
             "share" => self.share = self.data.activities.first().map(|a| crate::moments::ShareCard::new(a.id)),
             "celebrate" => {
                 self.celebrate = Some((vec!["Rekor 5K baru: 24:31".into(), "Tercepat di rute ini, 0:42 lebih cepat".into()], Instant::now()))
@@ -403,6 +416,30 @@ impl GhostApp {
         }
     }
 
+    /// With optional updates on: "what's new" once after an update, and the check on opening.
+    fn after_update(&mut self, ctx: &egui::Context) {
+        let s = &mut self.data.settings;
+        if !self.persist || !s.opt_updates {
+            return;
+        }
+        let now = env!("CARGO_PKG_VERSION");
+        if s.last_seen_version != now {
+            let file = model::data_dir().join("whats-new.txt");
+            if let Some((v, notes)) = std::fs::read_to_string(&file).ok().and_then(|t| t.split_once('\n').map(|(v, n)| (v.to_string(), n.to_string())))
+                && v == now
+            {
+                self.whats_new = Some((v, notes));
+            }
+            let _ = std::fs::remove_file(file);
+            crate::update::clean();
+            s.last_seen_version = now.to_string();
+            self.save();
+        }
+        if self.data.settings.auto_update_check {
+            self.update_task = Some(crate::update::check(ctx));
+        }
+    }
+
     pub fn say(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), 3.0));
     }
@@ -449,6 +486,7 @@ impl eframe::App for GhostApp {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        crate::offmap::set_theme(self.data.settings.theme());
         if self.applied_dark != Some(self.data.settings.dark) {
             let dark = self.data.settings.dark;
             ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
@@ -741,6 +779,19 @@ impl GhostApp {
                 });
             });
             ui.add_space(8.0);
+        }
+        if let Some((version, notes)) = self.whats_new.clone() {
+            draw::card(ui, |ui| {
+                ui.label(RichText::new(format!("Yang baru di GhostWalk {version}")).family(draw::semi()).color(ACCENT));
+                crate::screens::release_notes(ui, &notes);
+                if ui.button("Tutup").clicked() {
+                    self.whats_new = None;
+                }
+            });
+            ui.add_space(8.0);
+        }
+        if self.data.settings.opt_updates {
+            self.update_panel(ui, false);
         }
         let imp = self.data.settings.imperial;
 

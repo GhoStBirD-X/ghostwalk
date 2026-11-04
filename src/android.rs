@@ -238,15 +238,18 @@ pub fn coach_carry_over(dist_m: f64, elapsed_s: f64, moving_s: f64, first_s: f64
     });
 }
 
-/// After `coach_begin`: the planned route as [lat, lon, lat, lon, …] and the ghost as
-/// [metres, seconds, …] (either may be empty), for "off the route" and ghost updates by voice.
-pub fn coach_plan(route: &[f64], ghost: &[f64]) {
+/// After `coach_begin`: the planned route as [lat, lon, lat, lon, …], the ghost as
+/// [metres, seconds, …] and the turns as [metres along, direction code, …] (any may be empty),
+/// for "off the route", turn and ghost updates by voice.
+pub fn coach_plan(route: &[f64], ghost: &[f64], turns: &[f64]) {
     with_class("id.ghostwalk.app.Coach", |env, cls, _| {
         let r = env.new_double_array(route.len() as i32)?;
         env.set_double_array_region(&r, 0, route)?;
         let g = env.new_double_array(ghost.len() as i32)?;
         env.set_double_array_region(&g, 0, ghost)?;
-        env.call_static_method(cls, "plan", "([D[D)V", &[JValue::Object(&r), JValue::Object(&g)])?;
+        let t = env.new_double_array(turns.len() as i32)?;
+        env.set_double_array_region(&t, 0, turns)?;
+        env.call_static_method(cls, "plan", "([D[D[D)V", &[JValue::Object(&r), JValue::Object(&g), JValue::Object(&t)])?;
         Ok(())
     });
 }
@@ -283,4 +286,30 @@ pub fn publish(path: &std::path::Path, mime: &str, share: bool) -> Option<String
         Ok(s)
     })
     .filter(|s| !s.is_empty())
+}
+
+/// Checks the downloaded update against its SHA-256 and this app, then asks Android to install it.
+pub fn update_install(path: &std::path::Path, sha256: &str) {
+    with_class("id.ghostwalk.app.Updater", |env, cls, act| {
+        let p = env.new_string(path.to_string_lossy())?;
+        let h = env.new_string(sha256)?;
+        env.call_static_method(
+            cls,
+            "install",
+            "(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(act), JValue::Object(&p), JValue::Object(&h)],
+        )?;
+        Ok(())
+    });
+}
+
+/// How installing the update goes: (0 idle, 1 checking, 2 needs permission, 3 with Android, 4 failed; message).
+pub fn update_state() -> (i32, String) {
+    with_class("id.ghostwalk.app.Updater", |env, cls, _| {
+        let n = env.call_static_method(cls, "state", "()I", &[])?.i()?;
+        let m = env.call_static_method(cls, "message", "()Ljava/lang/String;", &[])?.l()?;
+        let m: String = if m.is_null() { String::new() } else { env.get_string(&m.into())?.into() };
+        Ok((n, m))
+    })
+    .unwrap_or_default()
 }

@@ -6,6 +6,8 @@ use crate::pmtiles::Archive;
 use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, epaint::Vertex, pos2};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use crate::model::MapTheme;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 pub const ATTRIBUTION: &str = "© OpenStreetMap";
@@ -13,6 +15,19 @@ pub const ATTRIBUTION: &str = "© OpenStreetMap";
 const CACHE_TILES: usize = 160;
 /// Never draw more tiles than this in one map.
 const MAX_TILES: u32 = 48;
+
+/// The map style for every map drawn, as an index into `MapTheme::ALL`.
+static THEME: AtomicU8 = AtomicU8::new(0);
+
+/// Sets the map style; the app calls this each frame with `Settings::theme`.
+pub fn set_theme(t: MapTheme) {
+    let i = MapTheme::ALL.iter().position(|x| *x == t).unwrap_or(0);
+    THEME.store(i as u8, Ordering::Relaxed);
+}
+
+pub fn theme() -> MapTheme {
+    MapTheme::ALL.get(THEME.load(Ordering::Relaxed) as usize).copied().unwrap_or_default()
+}
 
 /// Where map files live.
 pub fn dir() -> PathBuf {
@@ -256,40 +271,151 @@ struct Palette {
     rail: Color32,
     label: Color32,
     halo: Color32,
+    /// Scales every line.
+    widths: f32,
 }
 
 fn palette(dark: bool) -> Palette {
-    if dark {
-        Palette {
-            sea: Color32::from_rgb(17, 29, 40),
-            earth: Color32::from_rgb(25, 26, 29),
-            green: Color32::from_rgb(25, 38, 29),
-            sand: Color32::from_rgb(40, 38, 33),
-            building: Color32::from_rgb(35, 36, 41),
-            casing: Color32::from_rgb(19, 19, 22),
-            road: Color32::from_rgb(54, 56, 63),
-            highway: Color32::from_rgb(96, 78, 52),
-            path: Color32::from_rgb(62, 60, 57),
-            rail: Color32::from_rgb(58, 58, 64),
-            label: Color32::from_rgb(150, 150, 162),
-            halo: Color32::from_rgb(19, 19, 22),
-        }
-    } else {
-        Palette {
-            sea: Color32::from_rgb(170, 211, 230),
-            earth: Color32::from_rgb(242, 239, 233),
-            green: Color32::from_rgb(205, 232, 192),
-            sand: Color32::from_rgb(242, 232, 200),
-            building: Color32::from_rgb(222, 216, 208),
-            casing: Color32::from_rgb(214, 206, 196),
+    palette_for(theme(), dark)
+}
+
+const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
+    Color32::from_rgb(r, g, b)
+}
+
+fn palette_for(theme: MapTheme, dark: bool) -> Palette {
+    match theme {
+        MapTheme::Standard if dark => Palette {
+            sea: rgb(17, 29, 40),
+            earth: rgb(25, 26, 29),
+            green: rgb(25, 38, 29),
+            sand: rgb(40, 38, 33),
+            building: rgb(35, 36, 41),
+            casing: rgb(19, 19, 22),
+            road: rgb(54, 56, 63),
+            highway: rgb(96, 78, 52),
+            path: rgb(62, 60, 57),
+            rail: rgb(58, 58, 64),
+            label: rgb(150, 150, 162),
+            halo: rgb(19, 19, 22),
+            widths: 1.0,
+        },
+        MapTheme::Standard => Palette {
+            sea: rgb(170, 211, 230),
+            earth: rgb(242, 239, 233),
+            green: rgb(205, 232, 192),
+            sand: rgb(242, 232, 200),
+            building: rgb(222, 216, 208),
+            casing: rgb(214, 206, 196),
             road: Color32::WHITE,
-            highway: Color32::from_rgb(255, 206, 128),
-            path: Color32::from_rgb(196, 180, 160),
-            rail: Color32::from_rgb(170, 170, 176),
-            label: Color32::from_rgb(70, 70, 80),
-            halo: Color32::from_rgb(250, 248, 244),
-        }
+            highway: rgb(255, 206, 128),
+            path: rgb(196, 180, 160),
+            rail: rgb(170, 170, 176),
+            label: rgb(70, 70, 80),
+            halo: rgb(250, 248, 244),
+            widths: 1.0,
+        },
+        MapTheme::Neon => Palette {
+            sea: rgb(16, 8, 38),
+            earth: rgb(12, 9, 24),
+            green: rgb(14, 30, 34),
+            sand: rgb(30, 18, 38),
+            building: rgb(32, 18, 52),
+            casing: rgb(30, 14, 54),
+            road: rgb(0, 112, 132),
+            highway: rgb(196, 36, 140),
+            path: rgb(78, 60, 140),
+            rail: rgb(110, 46, 160),
+            label: rgb(150, 245, 255),
+            halo: rgb(12, 9, 24),
+            widths: 0.7,
+        },
+        MapTheme::Treasure => Palette {
+            sea: rgb(150, 178, 170),
+            earth: rgb(232, 214, 172),
+            green: rgb(196, 194, 140),
+            sand: rgb(240, 222, 170),
+            building: rgb(208, 182, 136),
+            casing: rgb(120, 82, 46),
+            road: rgb(244, 230, 196),
+            highway: rgb(196, 120, 64),
+            path: rgb(140, 96, 56),
+            rail: rgb(110, 80, 52),
+            label: rgb(84, 50, 24),
+            halo: rgb(240, 226, 190),
+            widths: 1.0,
+        },
+        MapTheme::Pixel => Palette {
+            sea: rgb(64, 120, 232),
+            earth: rgb(110, 184, 76),
+            green: rgb(56, 140, 52),
+            sand: rgb(232, 212, 120),
+            building: rgb(150, 150, 150),
+            casing: rgb(40, 40, 40),
+            road: rgb(200, 200, 200),
+            highway: rgb(250, 200, 60),
+            path: rgb(150, 110, 70),
+            rail: rgb(80, 80, 80),
+            label: Color32::WHITE,
+            halo: rgb(30, 30, 30),
+            widths: 1.5,
+        },
+        MapTheme::Radar => Palette {
+            sea: rgb(0, 26, 18),
+            earth: rgb(4, 12, 8),
+            green: rgb(4, 22, 12),
+            sand: rgb(10, 20, 10),
+            building: rgb(10, 36, 22),
+            casing: rgb(4, 12, 8),
+            road: rgb(40, 170, 90),
+            highway: rgb(120, 255, 150),
+            path: rgb(24, 110, 60),
+            rail: rgb(30, 90, 50),
+            label: rgb(120, 255, 160),
+            halo: rgb(4, 12, 8),
+            widths: 0.8,
+        },
+        MapTheme::Snow => Palette {
+            sea: rgb(120, 170, 220),
+            earth: rgb(250, 252, 255),
+            green: rgb(222, 236, 244),
+            sand: rgb(240, 244, 248),
+            building: rgb(204, 214, 228),
+            casing: rgb(110, 130, 160),
+            road: Color32::WHITE,
+            highway: rgb(70, 130, 210),
+            path: rgb(130, 150, 180),
+            rail: rgb(90, 100, 120),
+            label: rgb(20, 40, 70),
+            halo: Color32::WHITE,
+            widths: 1.2,
+        },
     }
+}
+
+/// The colour behind a map for `theme`, where no map file covers the area; None keeps the app's own.
+pub fn backdrop(dark: bool) -> Option<(Color32, Color32, Color32, Color32)> {
+    let t = theme();
+    if t == MapTheme::Standard {
+        return None;
+    }
+    let p = palette_for(t, dark);
+    Some((p.earth, p.building, p.road, p.green))
+}
+
+/// A small sample of `theme`: land, a park, water and two roads, for choosing between themes.
+pub fn swatch(p: &Painter, rect: Rect, theme: MapTheme, dark: bool) {
+    let pal = palette_for(theme, dark);
+    p.rect_filled(rect, 8.0, pal.earth);
+    let (w, h) = (rect.width(), rect.height());
+    let at = |x: f32, y: f32| pos2(rect.left() + w * x, rect.top() + h * y);
+    p.rect_filled(Rect::from_min_max(at(0.08, 0.1), at(0.42, 0.45)), 4.0, pal.green);
+    p.rect_filled(Rect::from_min_max(at(0.6, 0.62), at(0.94, 0.92)), 4.0, pal.sea);
+    for (a, b, c, wd) in [(at(0.0, 0.55), at(1.0, 0.5), pal.highway, 5.0), (at(0.5, 0.0), at(0.52, 1.0), pal.road, 3.5)] {
+        p.line_segment([a, b], Stroke::new(wd * pal.widths + 1.6, pal.casing));
+        p.line_segment([a, b], Stroke::new(wd * pal.widths, c));
+    }
+    p.circle_filled(at(0.25, 0.75), 3.0, pal.label);
 }
 
 /// Line width in pixels; `zoom` is the (fractional) map zoom level.
@@ -406,7 +532,7 @@ pub fn draw(p: &Painter, rect: Rect, v: &View, dark: bool) -> bool {
     }
 
     let stroke_for = |class: Line, casing: bool| -> Option<Stroke> {
-        let w = line_width(class, zoom);
+        let w = line_width(class, zoom) * pal.widths;
         let (color, w) = match class {
             Line::River | Line::Stream if !casing => (pal.sea, w),
             Line::Rail if !casing => (pal.rail, w),

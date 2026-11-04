@@ -58,6 +58,13 @@ public class Coach implements SensorEventListener {
     private static double[] route = new double[0];
     private static boolean offRoute;
     private static long offSince;
+    /** Turns as [metres along the route, 1 left / 2 right / 3 back, …, total metres, 0] (only with turn cues on),
+     * the metres along the route reached, the next turn to announce and whether "in 100 m" was said. */
+    private static double[] turns = new double[0];
+    private static double[] routeCum = new double[0];
+    private static double routeAt;
+    private static int nextTurn;
+    private static boolean warned;
     /** The ghost as [metres, seconds, …] on its own recording clock, or empty. */
     private static double[] ghost = new double[0];
     private static boolean ghostBeaten;
@@ -122,6 +129,8 @@ public class Coach implements SensorEventListener {
         tick = 0;
         route = new double[0];
         ghost = new double[0];
+        turns = new double[0];
+        routeCum = new double[0];
         offRoute = false;
         offSince = 0;
         ghostBeaten = false;
@@ -158,11 +167,21 @@ public class Coach implements SensorEventListener {
     }
 
     /** The route to stay on and the ghost to race, right after `begin` (and `carryOver`). */
-    public static void plan(double[] routeLatLon, double[] ghostDistTime) {
+    public static void plan(double[] routeLatLon, double[] ghostDistTime, double[] turnList) {
         route = routeLatLon;
         ghost = ghostDistTime;
+        turns = turnList;
         offRoute = false;
         offSince = 0;
+        routeCum = new double[route.length / 2];
+        for (int i = 1; i < routeCum.length; i++) {
+            float[] d = new float[1];
+            Location.distanceBetween(route[2 * i - 2], route[2 * i - 1], route[2 * i], route[2 * i + 1], d);
+            routeCum[i] = routeCum[i - 1] + d[0];
+        }
+        routeAt = 0;
+        nextTurn = 0;
+        warned = false;
         // Picked up again after the app was closed: don't announce what already happened.
         ghostBeaten = ghost.length >= 2 && dist >= ghost[ghost.length - 2];
         ghostFinished = ghost.length >= 2 && raceS() >= ghost[ghost.length - 1];
@@ -362,6 +381,7 @@ public class Coach implements SensorEventListener {
             nextKm++;
         }
         checkRoute(l);
+        checkTurns(l);
         checkGhost();
     }
 
@@ -392,6 +412,95 @@ public class Coach implements SensorEventListener {
                 }
             }
         }
+    }
+
+    /** "In 100 metres, turn left", then "turn left now", each once, while on the route; the last
+     * entry (code 0) is the finish. */
+    private static void checkTurns(Location l) {
+        if (turns.length < 2 || routeCum.length < 2) {
+            return;
+        }
+        double[] at = along(l.getLatitude(), l.getLongitude(), routeAt, 300);
+        if (at[1] > 150) {
+            // Joined the route somewhere else.
+            double[] any = along(l.getLatitude(), l.getLongitude(), 0, Double.MAX_VALUE);
+            if (any[1] < 50) {
+                at = any;
+            }
+        }
+        if (at[1] >= 100) {
+            return;
+        }
+        routeAt = at[0];
+        // Turns already passed (or skipped by joining later) are not announced.
+        while (nextTurn * 2 + 2 < turns.length && turns[nextTurn * 2] < routeAt - 20) {
+            nextTurn++;
+            warned = false;
+        }
+        if (offRoute || nextTurn * 2 >= turns.length) {
+            return;
+        }
+        double left = turns[nextTurn * 2] - routeAt;
+        int code = (int) turns[nextTurn * 2 + 1];
+        if (code == 0) {
+            if (left <= 20) {
+                nextTurn++;
+                buzz(400);
+                if (voice) {
+                    say("Rute selesai.");
+                }
+            }
+            return;
+        }
+        String words = turnWords(code);
+        if (left <= 20) {
+            buzz(250);
+            if (voice) {
+                say(capital(words) + " sekarang.");
+            }
+            nextTurn++;
+            warned = false;
+        } else if (left <= 110 && !warned) {
+            warned = true;
+            if (voice) {
+                say("Dalam " + (left > 70 ? 100 : 50) + " meter, " + words + ".");
+            }
+        }
+    }
+
+    private static String turnWords(int code) {
+        return code == 1 ? "belok kiri" : code == 2 ? "belok kanan" : "putar balik";
+    }
+
+    private static String capital(String s) {
+        return s.isEmpty() ? s : Character.toUpperCase(s.charAt(0)) + s.substring(1);
+    }
+
+    /** {metres along the route, metres away from it} for (lat, lon), looking only from 100 m
+     * before `from` to `ahead` metres past it, so a loop's finish is not taken for its start. */
+    private static double[] along(double lat, double lon, double from, double ahead) {
+        double k = 111320;
+        double cos = Math.cos(Math.toRadians(lat));
+        double[] best = {0, Double.MAX_VALUE};
+        for (int i = 1; i < routeCum.length; i++) {
+            if (routeCum[i - 1] > from + ahead) {
+                break;
+            }
+            if (routeCum[i] < from - 100) {
+                continue;
+            }
+            double ax = (route[2 * i - 1] - lon) * k * cos, ay = (route[2 * i - 2] - lat) * k;
+            double bx = (route[2 * i + 1] - lon) * k * cos, by = (route[2 * i] - lat) * k;
+            double dx = bx - ax, dy = by - ay;
+            double len2 = dx * dx + dy * dy;
+            double f = len2 > 0 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / len2)) : 0;
+            double off = Math.hypot(ax + dx * f, ay + dy * f);
+            if (off < best[1]) {
+                best[0] = routeCum[i - 1] + (routeCum[i] - routeCum[i - 1]) * f;
+                best[1] = off;
+            }
+        }
+        return best;
     }
 
     /** Metres from (lat, lon) to the nearest piece of the route. */

@@ -650,9 +650,10 @@ pub fn icon(p: &egui::Painter, kind: Icon, c: Pos2, color: Color32) {
 // ---------- maps ----------
 
 pub fn map_backdrop(ui: &Ui, p: &egui::Painter, rect: Rect, radius: f32) {
-    p.rect_filled(rect, radius, map_bg(ui));
-    let line = pick(ui, Color32::from_rgb(34, 35, 40), Color32::from_rgb(220, 228, 216));
-    let road = pick(ui, Color32::from_rgb(42, 44, 50), Color32::from_rgb(250, 250, 246));
+    let themed = crate::offmap::backdrop(ui.visuals().dark_mode);
+    p.rect_filled(rect, radius, themed.map_or(map_bg(ui), |t| t.0));
+    let line = themed.map_or(pick(ui, Color32::from_rgb(34, 35, 40), Color32::from_rgb(220, 228, 216)), |t| t.1);
+    let road = themed.map_or(pick(ui, Color32::from_rgb(42, 44, 50), Color32::from_rgb(250, 250, 246)), |t| t.2);
     let step = 28.0;
     let mut x = rect.left() + step / 2.0;
     let mut i = 0;
@@ -677,7 +678,7 @@ pub fn map_backdrop(ui: &Ui, p: &egui::Painter, rect: Rect, radius: f32) {
         i += 1;
     }
     // A soft "park" patch so the map doesn't look empty.
-    let park = pick(ui, Color32::from_rgb(28, 40, 32), Color32::from_rgb(205, 228, 196));
+    let park = themed.map_or(pick(ui, Color32::from_rgb(28, 40, 32), Color32::from_rgb(205, 228, 196)), |t| t.3);
     let pr = Rect::from_min_size(
         pos2(rect.left() + rect.width() * 0.62, rect.top() + rect.height() * 0.12),
         vec2(rect.width() * 0.22, rect.height() * 0.3),

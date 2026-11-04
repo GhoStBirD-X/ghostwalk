@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- INTERNET is only for downloading map files the person asks for; nothing else goes out. -->
+<!-- INTERNET is only for downloading map files the person asks for, and for the optional update
+     check once switched on (no location or activity data); nothing else goes out. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="id.ghostwalk.app"
     android:versionCode="8"
@@ -14,6 +15,8 @@
     <!-- Step counter, and a buzz for interval changes. -->
     <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Installing a checked update, only when the optional updates are switched on and confirmed. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
     <application
         android:label="GhostWalk"

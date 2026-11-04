@@ -78,6 +78,8 @@ pub struct Recorder {
     /// Filled in from those by `arm`: the route's points and metres along it, and the ghost.
     pub plan: Vec<TrackPoint>,
     pub plan_cum: Vec<f64>,
+    /// The route's turns, for turn cues.
+    pub turns: Vec<model::Turn>,
     pub ghost_run: Option<model::Ghost>,
     /// Metres along the route reached so far, and how far the last position was from it.
     pub route_at: f64,
@@ -111,6 +113,7 @@ impl Recorder {
             ghost: None,
             plan: Vec::new(),
             plan_cum: Vec::new(),
+            turns: Vec::new(),
             ghost_run: None,
             route_at: 0.0,
             off_m: None,
@@ -248,6 +251,7 @@ impl Recorder {
         self.route = route.map(|r| r.id);
         self.plan = route.map(|r| r.track()).unwrap_or_default();
         self.plan_cum = model::cumulative(&self.plan);
+        self.turns = model::turns(&self.plan, &self.plan_cum);
         self.ghost_run = self
             .ghost
             .and_then(|id| data.activities.iter().find(|a| a.id == id))
@@ -256,7 +260,10 @@ impl Recorder {
     }
 
     /// Hands the route and ghost to the phone's coach, for spoken updates with the screen off.
-    pub fn send_plan(&self) {
+    /// Turns go along only with `turn_cues` (an optional feature).
+    pub fn send_plan(&self, turn_cues: bool) {
+        #[cfg(not(target_os = "android"))]
+        let _ = turn_cues;
         #[cfg(target_os = "android")]
         {
             let route: Vec<f64> = self.plan.iter().flat_map(|p| [p.lat, p.lon]).collect();
@@ -265,7 +272,14 @@ impl Recorder {
                 .as_ref()
                 .map(|g| g.cum.iter().zip(&g.times).flat_map(|(d, t)| [*d, *t]).collect())
                 .unwrap_or_default();
-            crate::android::coach_plan(&route, &ghost);
+            // The finish goes last, as code 0.
+            let finish = self.plan_cum.last().map(|d| [*d, 0.0]);
+            let turns: Vec<f64> = if turn_cues {
+                self.turns.iter().map(|t| [t.at_m, t.dir.code()]).chain(finish).flatten().collect()
+            } else {
+                Vec::new()
+            };
+            crate::android::coach_plan(&route, &ghost, &turns);
         }
     }
 
@@ -502,7 +516,7 @@ impl GhostApp {
                 let settings = self.data.settings.clone();
                 self.rec.arm(&self.data);
                 self.rec.begin(&settings);
-                self.rec.send_plan();
+                self.rec.send_plan(settings.opt_turn_cues);
             }
             if self.rec.gps < 0 {
                 ui.label(
@@ -666,7 +680,35 @@ impl GhostApp {
             ui.painter().rect_filled(r, 4.0, draw::raised(ui));
             ui.painter().rect_filled(egui::Rect::from_min_size(r.min, vec2(r.width() * f, r.height())), 4.0, draw::sport_color(self.rec.sport));
             ui.add_space(8.0);
+            if self.data.settings.opt_turn_cues && off.is_none() {
+                self.next_turn_card(ui);
+            }
         }
+    }
+
+    /// With turn cues on: the next turn on the route and how far off it is.
+    fn next_turn_card(&self, ui: &mut Ui) {
+        let imp = self.data.settings.imperial;
+        let at = self.rec.route_at;
+        let Some(t) = self.rec.turns.iter().find(|t| t.at_m > at - 5.0) else {
+            return;
+        };
+        let color = draw::sport_color(self.rec.sport);
+        draw::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
+                turn_arrow(ui.painter(), r.center(), 18.0, t.dir, color);
+                ui.vertical(|ui| {
+                    let left = (t.at_m - at).max(0.0);
+                    let when = if left < 15.0 { "Sekarang".to_string() } else { format!("Dalam {}", draw::dist(left, imp)) };
+                    ui.label(RichText::new(when).size(12.5).color(draw::muted(ui)));
+                    let mut words = t.dir.words().to_string();
+                    words[..1].make_ascii_uppercase();
+                    ui.label(RichText::new(words).family(draw::heavy()).size(18.0).color(draw::strong(ui)));
+                });
+            });
+        });
+        ui.add_space(8.0);
     }
 
     /// While recording: big numbers you can read on the move, and controls that are hard to hit by accident.
@@ -861,6 +903,15 @@ impl GhostApp {
             let ghost_at = self.rec.ghost_run.as_ref().map(|g| g.pos_at(self.rec.race_clock().unwrap_or(0.0)));
             let color = draw::sport_color(self.rec.sport);
             draw::live_map(ui, &self.rec.track, self.rec.shown_plan(), ghost_at, color, 200.0, around);
+            if self.data.settings.opt_themes {
+                // Changing the map's look never touches the recording.
+                let st = &mut self.data.settings;
+                let i = model::MapTheme::ALL.iter().position(|t| *t == st.map_theme).unwrap_or(0);
+                if ui.small_button(format!("Tema peta: {} ›", st.map_theme.name())).clicked() {
+                    st.map_theme = model::MapTheme::ALL[(i + 1) % model::MapTheme::ALL.len()];
+                    self.save();
+                }
+            }
         }
         if running {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
@@ -1092,4 +1143,24 @@ mod tests {
         r.begin(&model::Settings::default());
         assert_ne!(r.gps, 2, "a stale \"receiving\" would keep GPS off for the next recording");
     }
+}
+
+/// An arrow for a turn, centred on `c`, `s` points from the middle to the tip.
+fn turn_arrow(p: &egui::Painter, c: egui::Pos2, s: f32, dir: model::TurnDir, color: egui::Color32) {
+    let st = Stroke::new(4.0, color);
+    let base = c + vec2(0.0, s);
+    let bend = c + vec2(0.0, -s * 0.1);
+    let (tip, head): (egui::Pos2, [egui::Vec2; 2]) = match dir {
+        model::TurnDir::Left => (c + vec2(-s, -s * 0.1), [vec2(0.45, -0.45), vec2(0.45, 0.45)]),
+        model::TurnDir::Right => (c + vec2(s, -s * 0.1), [vec2(-0.45, -0.45), vec2(-0.45, 0.45)]),
+        model::TurnDir::Back => {
+            let top = c + vec2(0.0, -s);
+            let end = c + vec2(-s * 0.7, s * 0.2);
+            p.line(vec![base + vec2(s * 0.35, 0.0), c + vec2(s * 0.35, -s * 0.6), top, c + vec2(-s * 0.7, -s * 0.6), end], st);
+            p.line(vec![end + vec2(-s * 0.4, -s * 0.4), end, end + vec2(s * 0.4, -s * 0.4)], st);
+            return;
+        }
+    };
+    p.line(vec![base, bend, tip], st);
+    p.line(vec![tip + head[0] * s, tip, tip + head[1] * s], st);
 }

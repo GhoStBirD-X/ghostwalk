@@ -908,11 +908,13 @@ impl GhostApp {
             });
         });
         ui.add_space(8.0);
+        self.optional_features(ui);
+        ui.add_space(8.0);
         draw::card(ui, |ui| {
             ui.label(RichText::new("Privasi").family(draw::semi()).color(draw::GREEN));
             for line in [
                 "Tidak perlu akun, email, nomor HP atau tanggal lahir.",
-                "Internet hanya dipakai saat Anda mengunduh peta. Lokasi, rute, dan aktivitas Anda tidak pernah dikirim ke mana pun.",
+                "Internet hanya dipakai saat Anda mengunduh peta, atau memeriksa update bila fitur itu Anda nyalakan. Lokasi, rute, dan aktivitas Anda tidak pernah dikirim ke mana pun.",
                 "Tidak ada iklan, pelacak, atau analitik.",
                 "Semua aktivitas disimpan di satu file di perangkat ini:",
             ] {
@@ -996,9 +998,200 @@ impl GhostApp {
             }
         });
         let s = &self.data.settings;
-        if s.nickname != before.nickname || s.imperial != before.imperial || s.dark != before.dark || s.weight_kg != before.weight_kg {
+        if s.nickname != before.nickname
+            || s.imperial != before.imperial
+            || s.dark != before.dark
+            || s.weight_kg != before.weight_kg
+            || s.opt_themes != before.opt_themes
+            || s.map_theme != before.map_theme
+            || s.opt_turn_cues != before.opt_turn_cues
+            || s.opt_updates != before.opt_updates
+            || s.auto_update_check != before.auto_update_check
+        {
             self.save();
         }
+    }
+
+    /// Features that stay off until switched on here.
+    fn optional_features(&mut self, ui: &mut Ui) {
+        draw::card(ui, |ui| {
+            ui.label(RichText::new("Fitur pilihan").family(draw::semi()).color(draw::strong(ui)));
+            ui.label(RichText::new("Semuanya mati sampai Anda nyalakan. Bila dimatikan lagi, app kembali seperti semula.").size(12.0).color(draw::muted(ui)));
+            ui.add_space(4.0);
+
+            let st = &mut self.data.settings;
+            ui.checkbox(&mut st.opt_themes, RichText::new("Tema peta").family(draw::semi()));
+            ui.label(RichText::new("Ganti warna peta offline: neon, peta harta, piksel, radar, atau salju.").size(12.0).color(draw::muted(ui)));
+            if st.opt_themes {
+                let dark = ui.visuals().dark_mode;
+                let cols = 3;
+                let w = (ui.available_width() - 8.0 * (cols - 1) as f32) / cols as f32;
+                for row in model::MapTheme::ALL.chunks(cols) {
+                    ui.horizontal(|ui| {
+                        for t in row {
+                            let (r, resp) = ui.allocate_exact_size(vec2(w, w * 0.62 + 18.0), Sense::click());
+                            let pic = egui::Rect::from_min_size(r.min, vec2(w, w * 0.62));
+                            offmap::swatch(ui.painter(), pic, *t, dark);
+                            let on = st.map_theme == *t;
+                            if on {
+                                ui.painter().rect_stroke(pic, 8.0, Stroke::new(2.5, ACCENT), egui::StrokeKind::Outside);
+                            }
+                            ui.painter().text(
+                                pos2(r.center().x, r.bottom()),
+                                Align2::CENTER_BOTTOM,
+                                t.name(),
+                                FontId::new(11.5, draw::semi()),
+                                if on { ACCENT } else { draw::strong(ui) },
+                            );
+                            if resp.clicked() {
+                                st.map_theme = *t;
+                            }
+                        }
+                    });
+                }
+            }
+            ui.add_space(6.0);
+            ui.checkbox(&mut st.opt_turn_cues, RichText::new("Panduan belokan").family(draw::semi()));
+            ui.label(
+                RichText::new("Saat lari mengikuti rute: \"Dalam 100 meter, belok kiri\", getar di tiap belokan, dan panah belokan berikutnya. Berlaku mulai rekaman berikutnya.")
+                    .size(12.0)
+                    .color(draw::muted(ui)),
+            );
+            ui.add_space(6.0);
+            ui.checkbox(&mut st.opt_updates, RichText::new("Update di dalam app").family(draw::semi()));
+            ui.label(
+                RichText::new("Memeriksa versi baru di GitHub dan memasangnya setelah dicek (SHA-256, nama paket, dan tanda tangan). Hanya meminta info rilis; tidak ada data Anda yang dikirim.")
+                    .size(12.0)
+                    .color(draw::muted(ui)),
+            );
+            if st.opt_updates {
+                ui.checkbox(&mut st.auto_update_check, "Periksa otomatis saat app dibuka");
+            }
+        });
+        if !self.data.settings.opt_updates {
+            self.update_task = None;
+            return;
+        }
+        ui.add_space(8.0);
+        self.update_panel(ui, true);
+    }
+
+    /// The state of the update check, with what can be done next. `always` also shows the
+    /// "check" button and the quiet states; elsewhere only a found update is shown.
+    pub fn update_panel(&mut self, ui: &mut Ui, always: bool) {
+        use crate::update::{self, Status};
+        if let Some(t) = &self.update_task
+            && t.busy()
+        {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        #[cfg(target_os = "android")]
+        let installing = crate::android::update_state();
+        #[cfg(not(target_os = "android"))]
+        let installing = (0, String::new());
+        if installing.0 != 0 {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        enum Act {
+            Check,
+            Download(update::Release),
+            Install(update::Release, std::path::PathBuf, String),
+            Later,
+        }
+        let mut act = None;
+        let status = self.update_task.as_ref().map(|t| t.status.clone());
+        let guard = status.as_ref().map(|s| s.lock().unwrap());
+        let quiet = matches!(guard.as_deref(), None | Some(Status::UpToDate | Status::Checking | Status::Failed(_)));
+        if quiet && !always {
+            return;
+        }
+        draw::card(ui, |ui| {
+            ui.label(RichText::new("Update GhostWalk").family(draw::semi()).color(draw::strong(ui)));
+            ui.label(RichText::new(format!("Versi terpasang {}", env!("CARGO_PKG_VERSION"))).size(12.0).color(draw::muted(ui)));
+            match guard.as_deref() {
+                None => {}
+                Some(Status::Checking) => {
+                    ui.label("Memeriksa…");
+                }
+                Some(Status::UpToDate) => {
+                    ui.label(RichText::new("Sudah versi terbaru.").color(draw::GREEN));
+                }
+                Some(Status::Failed(e)) => {
+                    ui.label(RichText::new(e).color(draw::RED));
+                }
+                Some(Status::Available(r)) => {
+                    ui.label(RichText::new(format!("Versi baru {} tersedia", r.version)).family(draw::semi()).color(ACCENT));
+                    release_notes(ui, &r.notes);
+                    if cfg!(target_os = "android") {
+                        ui.horizontal(|ui| {
+                            let size = if r.size > 0 { format!(" ({:.1} MB)", r.size as f64 / 1e6) } else { String::new() };
+                            if draw::accent_button(ui, &format!("Unduh update{size}")).clicked() {
+                                act = Some(Act::Download(r.clone()));
+                            }
+                            if ui.button("Nanti").clicked() {
+                                act = Some(Act::Later);
+                            }
+                        });
+                    } else {
+                        ui.hyperlink_to("Buka halaman rilis", update::RELEASES);
+                    }
+                }
+                Some(Status::Downloading { release, done }) => {
+                    ui.label(format!("Mengunduh {}…", release.version));
+                    let f = if release.size > 0 { *done as f32 / release.size as f32 } else { 0.0 };
+                    draw::progress(ui, f, ACCENT);
+                }
+                Some(Status::Ready(r, path, sum)) => {
+                    ui.label(RichText::new(format!("Versi {} siap dipasang", r.version)).family(draw::semi()).color(ACCENT));
+                    ui.label(
+                        RichText::new("SHA-256 cocok dengan rilisnya. Sebelum dipasang, nama paket dan tanda tangannya juga dicek. Data Anda tetap ada.")
+                            .size(12.0)
+                            .color(draw::muted(ui)),
+                    );
+                    match installing.0 {
+                        1 => {
+                            ui.label("Memeriksa file…");
+                        }
+                        3 => {
+                            ui.label("Ikuti langkah dari Android untuk memasang.");
+                        }
+                        2 => {
+                            ui.label(
+                                RichText::new("Izinkan GhostWalk memasang app (\"Instal app tidak dikenal\"), lalu kembali dan tekan Pasang lagi.")
+                                    .size(12.5)
+                                    .color(ACCENT),
+                            );
+                        }
+                        4 => {
+                            ui.label(RichText::new(&installing.1).color(draw::RED));
+                        }
+                        _ => {}
+                    }
+                    if !matches!(installing.0, 1 | 3) && draw::accent_button(ui, "Pasang").clicked() {
+                        act = Some(Act::Install(r.clone(), path.clone(), sum.clone()));
+                    }
+                }
+            }
+            let busy = matches!(guard.as_deref(), Some(Status::Checking | Status::Downloading { .. }));
+            if always && quiet && !busy && ui.button("Periksa update").clicked() {
+                act = Some(Act::Check);
+            }
+        });
+        drop(guard);
+        match act {
+            Some(Act::Check) => self.update_task = Some(update::check(ui.ctx())),
+            Some(Act::Download(r)) => self.update_task = Some(update::download(ui.ctx(), r)),
+            Some(Act::Later) => self.update_task = None,
+            Some(Act::Install(r, path, sum)) => {
+                // Shown once after the update, from the new version.
+                let _ = std::fs::write(model::data_dir().join("whats-new.txt"), format!("{}\n{}", r.version, r.notes));
+                #[cfg(target_os = "android")]
+                crate::android::update_install(&path, &sum);
+                let _ = (path, sum);
+            }
+            None => {}
+        }
+        ui.add_space(8.0);
     }
 
     /// Replaces all data with a backup file made by "Cadangkan (JSON)".
@@ -1298,4 +1491,23 @@ impl GhostApp {
 /// "12,3 MB"
 fn mb(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / 1_048_576.0).replace('.', ",")
+}
+
+/// Release notes from GitHub, as plain text: Markdown marks taken off, at most a few lines tall.
+pub fn release_notes(ui: &mut Ui, notes: &str) {
+    if notes.is_empty() {
+        return;
+    }
+    let text: String = notes
+        .lines()
+        .map(|l| {
+            let l = l.trim_start_matches('#').trim();
+            let l = l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")).map_or(l.to_string(), |r| format!("• {r}"));
+            l.replace("**", "").replace('`', "")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    egui::ScrollArea::vertical().max_height(180.0).id_salt("release_notes").show(ui, |ui| {
+        ui.label(RichText::new(text.trim()).size(12.5));
+    });
 }

@@ -383,6 +383,59 @@ pub struct Settings {
     pub interval: Interval,
     /// False until the welcome screens were seen; existing data counts as seen.
     pub onboarded: bool,
+    /// Optional features, each off until switched on in the settings.
+    pub opt_themes: bool,
+    pub map_theme: MapTheme,
+    /// Spoken and shown turns while following a route.
+    pub opt_turn_cues: bool,
+    /// Looking for a newer release on GitHub; only when switched on.
+    pub opt_updates: bool,
+    /// With `opt_updates`: look each time the app opens, not only from the button.
+    pub auto_update_check: bool,
+    /// The version whose "what's new" was last shown.
+    pub last_seen_version: String,
+}
+
+impl Settings {
+    /// The map style in use: the chosen one only while map themes are switched on.
+    pub fn theme(&self) -> MapTheme {
+        if self.opt_themes { self.map_theme } else { MapTheme::Standard }
+    }
+}
+
+/// How the offline map is coloured.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MapTheme {
+    /// Follows the light or dark look of the app.
+    #[default]
+    Standard,
+    Neon,
+    Treasure,
+    Pixel,
+    Radar,
+    Snow,
+}
+
+impl MapTheme {
+    pub const ALL: [MapTheme; 6] = [
+        MapTheme::Standard,
+        MapTheme::Neon,
+        MapTheme::Treasure,
+        MapTheme::Pixel,
+        MapTheme::Radar,
+        MapTheme::Snow,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MapTheme::Standard => "Standar",
+            MapTheme::Neon => "Neon Malam",
+            MapTheme::Treasure => "Peta Harta",
+            MapTheme::Pixel => "Piksel",
+            MapTheme::Radar => "Radar",
+            MapTheme::Snow => "Salju",
+        }
+    }
 }
 
 impl Default for Settings {
@@ -397,6 +450,12 @@ impl Default for Settings {
             auto_pause: true,
             interval: Interval::default(),
             onboarded: true,
+            opt_themes: false,
+            map_theme: MapTheme::Standard,
+            opt_turn_cues: false,
+            opt_updates: false,
+            auto_update_check: false,
+            last_seen_version: String::new(),
         }
     }
 }
@@ -696,6 +755,92 @@ pub fn locate_on(path: &[TrackPoint], cum: &[f64], p: &TrackPoint, from: f64, ah
         }
     }
     best
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TurnDir {
+    Left,
+    Right,
+    Back,
+}
+
+impl TurnDir {
+    /// How turns are numbered for the phone's coach.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn code(self) -> f64 {
+        match self {
+            TurnDir::Left => 1.0,
+            TurnDir::Right => 2.0,
+            TurnDir::Back => 3.0,
+        }
+    }
+
+    pub fn words(self) -> &'static str {
+        match self {
+            TurnDir::Left => "belok kiri",
+            TurnDir::Right => "belok kanan",
+            TurnDir::Back => "putar balik",
+        }
+    }
+}
+
+/// A bend in a route worth telling the runner about.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Turn {
+    /// Metres along the route (as `cumulative` counts them).
+    pub at_m: f64,
+    pub dir: TurnDir,
+    /// Degrees of the change in heading, 0 to 180.
+    pub angle: f64,
+}
+
+/// The turns along `path`: corners where the heading changes by 35° or more. Points closer than
+/// 15 m to the previous corner are skipped, so a wobbly hand-drawn line does not count as turns.
+pub fn turns(path: &[TrackPoint], cum: &[f64]) -> Vec<Turn> {
+    // Corners: indices at least 15 m apart.
+    let mut keep: Vec<usize> = Vec::new();
+    for i in 0..path.len() {
+        if keep.last().is_none_or(|&k| cum[i] - cum[k] >= 15.0) {
+            keep.push(i);
+        }
+    }
+    if let (Some(&k), Some(last)) = (keep.last(), path.len().checked_sub(1)) {
+        if k != last {
+            // The finish stays a corner of its own; the one just before it gives way.
+            if keep.len() > 1 && cum[last] - cum[k] < 15.0 {
+                keep.pop();
+            }
+            keep.push(last);
+        }
+    }
+    let heading = |a: &TrackPoint, b: &TrackPoint| {
+        let cos = a.lat.to_radians().cos();
+        ((b.lon - a.lon) * cos).atan2(b.lat - a.lat).to_degrees()
+    };
+    let mut out = Vec::new();
+    for w in keep.windows(3) {
+        let (a, b, c) = (&path[w[0]], &path[w[1]], &path[w[2]]);
+        let mut d = heading(b, c) - heading(a, b);
+        while d > 180.0 {
+            d -= 360.0;
+        }
+        while d < -180.0 {
+            d += 360.0;
+        }
+        let angle = d.abs();
+        if angle < 35.0 {
+            continue;
+        }
+        let dir = if angle >= 150.0 {
+            TurnDir::Back
+        } else if d > 0.0 {
+            TurnDir::Right
+        } else {
+            TurnDir::Left
+        };
+        out.push(Turn { at_m: cum[w[1]], dir, angle });
+    }
+    out
 }
 
 /// True when `track` goes the way of `route`: about as long, same start and finish, and passing along it.
@@ -1153,5 +1298,51 @@ mod tests {
         assert_eq!(Data::goal_share(&g, &a), 0.0);
         a.sport = Sport::Ride;
         assert_eq!(Data::goal_share(&g, &a), 1.0);
+    }
+
+    fn geo_track(geo: &[[f64; 2]]) -> Vec<TrackPoint> {
+        geo.iter().map(|g| TrackPoint { lat: g[0], lon: g[1], ele: None, t: None }).collect()
+    }
+
+    #[test]
+    fn turns_are_found_at_corners() {
+        // North 500 m, east 500 m (a right turn), north 500 m (a left turn).
+        let flat = [[0.0, 0.0], [0.0, -500.0], [500.0, -500.0], [500.0, -1000.0]];
+        let path = geo_track(&flat_to_geo(&flat, (-6.2, 106.8)));
+        let cum = cumulative(&path);
+        let t = turns(&path, &cum);
+        assert_eq!(t.iter().map(|t| t.dir).collect::<Vec<_>>(), [TurnDir::Right, TurnDir::Left]);
+        assert!((t[0].at_m - 500.0).abs() < 5.0 && (t[1].at_m - 1000.0).abs() < 5.0, "{t:?}");
+        assert!((t[0].angle - 90.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn straight_and_wobbly_lines_have_no_turns() {
+        let straight = [[0.0, 0.0], [0.0, -300.0], [0.0, -600.0]];
+        let path = geo_track(&flat_to_geo(&straight, (-6.2, 106.8)));
+        assert!(turns(&path, &cumulative(&path)).is_empty());
+        // Small zigzags a few metres apart are not turns.
+        let wobble: Vec<[f32; 2]> = (0..40).map(|i| [if i % 2 == 0 { 0.0 } else { 3.0 }, -(i as f32) * 10.0]).collect();
+        let path = geo_track(&flat_to_geo(&wobble, (-6.2, 106.8)));
+        assert!(turns(&path, &cumulative(&path)).is_empty());
+    }
+
+    #[test]
+    fn a_hairpin_is_a_u_turn() {
+        let flat = [[0.0, 0.0], [0.0, -400.0], [20.0, 0.0]];
+        let path = geo_track(&flat_to_geo(&flat, (-6.2, 106.8)));
+        let t = turns(&path, &cumulative(&path));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].dir, TurnDir::Back);
+    }
+
+    #[test]
+    fn optional_features_start_off_and_old_settings_load() {
+        let s: Settings = serde_json::from_str(r#"{"nickname":"a","dark":false}"#).unwrap();
+        assert!(!s.opt_themes && !s.opt_turn_cues && !s.opt_updates && !s.auto_update_check);
+        let mut s = Settings { map_theme: MapTheme::Radar, ..Settings::default() };
+        assert_eq!(s.theme(), MapTheme::Standard, "a chosen theme waits until themes are on");
+        s.opt_themes = true;
+        assert_eq!(s.theme(), MapTheme::Radar);
     }
 }
