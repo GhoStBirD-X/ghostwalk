@@ -5,7 +5,7 @@ use crate::draw::{self, ACCENT};
 use crate::gpx;
 use crate::mapdl::{self, Status};
 use crate::offmap;
-use crate::model::{self, Gear, Metric, Period, Route, Sport};
+use crate::model::{self, Gear, Metric, Period, Route, Sport, Total};
 use chrono::{Datelike, Local, NaiveDate, Timelike};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, RichText, Sense, Stroke, Ui, pos2, vec2};
 
@@ -383,9 +383,9 @@ impl GhostApp {
         });
 
         draw::heading(ui, "Tantangan bulan ini");
-        let month_km: f64 = self.data.in_period(Period::Month, None).map(|a| a.distance_m).sum::<f64>() / 1000.0;
-        let month_run: f64 = self.data.in_period(Period::Month, Some(Sport::Run)).map(|a| a.distance_m).sum::<f64>() / 1000.0;
-        let month_up: f64 = self.data.in_period(Period::Month, None).map(|a| a.elev_gain_m).sum();
+        let month_km: f64 = self.data.in_period(Period::Month, None).map(|a| a.distance_m).total() / 1000.0;
+        let month_run: f64 = self.data.in_period(Period::Month, Some(Sport::Run)).map(|a| a.distance_m).total() / 1000.0;
+        let month_up: f64 = self.data.in_period(Period::Month, None).map(|a| a.elev_gain_m).total();
         let month_n = self.data.in_period(Period::Month, None).count() as f64;
         let longest = self.data.in_period(Period::Month, None).map(|a| a.duration_s).fold(0.0, f64::max) / 60.0;
         let challenges = [
@@ -421,7 +421,7 @@ impl GhostApp {
 
         draw::heading(ui, "Lencana");
         let acts = &self.data.activities;
-        let total_km: f64 = acts.iter().map(|a| a.distance_m).sum::<f64>() / 1000.0;
+        let total_km: f64 = acts.iter().map(|a| a.distance_m).total() / 1000.0;
         let badges = [
             ("Langkah pertama", !acts.is_empty()),
             ("5K pertama", acts.iter().any(|a| a.sport == Sport::Run && a.distance_m >= 5000.0)),
@@ -484,8 +484,8 @@ impl GhostApp {
                 ui,
                 &[
                     ("Aktivitas", acts.len().to_string()),
-                    ("Total jarak", draw::dist(acts.iter().map(|a| a.distance_m).sum(), imp)),
-                    ("Total waktu", draw::dur(acts.iter().map(|a| a.duration_s).sum())),
+                    ("Total jarak", draw::dist(acts.iter().map(|a| a.distance_m).total(), imp)),
+                    ("Total waktu", draw::dur(acts.iter().map(|a| a.duration_s).total())),
                 ],
                 3,
             );
@@ -598,9 +598,9 @@ impl GhostApp {
         ui.add_space(8.0);
         for (period, label) in [(Period::Week, "Minggu ini"), (Period::Month, "Bulan ini"), (Period::Year, "Tahun ini")] {
             let acts: Vec<_> = self.data.in_period(period, sport).collect();
-            let dist: f64 = acts.iter().map(|a| a.distance_m).sum();
-            let time: f64 = acts.iter().map(|a| a.duration_s).sum();
-            let up: f64 = acts.iter().map(|a| a.elev_gain_m).sum();
+            let dist: f64 = acts.iter().map(|a| a.distance_m).total();
+            let time: f64 = acts.iter().map(|a| a.duration_s).total();
+            let up: f64 = acts.iter().map(|a| a.elev_gain_m).total();
             let n = acts.len();
             draw::card(ui, |ui| {
                 ui.label(RichText::new(label).family(draw::semi()).color(draw::strong(ui)));
@@ -619,9 +619,9 @@ impl GhostApp {
         }
         draw::card(ui, |ui| {
             ui.label(RichText::new("Pembagian waktu per olahraga").family(draw::semi()).color(draw::strong(ui)));
-            let total: f64 = self.data.activities.iter().map(|a| a.duration_s).sum::<f64>().max(1.0);
+            let total: f64 = self.data.activities.iter().map(|a| a.duration_s).total().max(1.0);
             for s in Sport::ALL {
-                let t: f64 = self.data.activities.iter().filter(|a| a.sport == s).map(|a| a.duration_s).sum();
+                let t: f64 = self.data.activities.iter().filter(|a| a.sport == s).map(|a| a.duration_s).total();
                 if t > 0.0 {
                     ui.horizontal(|ui| {
                         ui.add_sized([70.0, 16.0], egui::Label::new(RichText::new(s.name()).size(12.0)));
@@ -726,7 +726,7 @@ impl GhostApp {
             }
         });
         ui.add_space(8.0);
-        let total: f64 = self.data.activities.iter().filter(|a| a.date().year() == y && a.date().month() == m).map(|a| a.duration_s).sum();
+        let total: f64 = self.data.activities.iter().filter(|a| a.date().year() == y && a.date().month() == m).map(|a| a.duration_s).total();
         ui.label(RichText::new(format!("{} aktivitas · {}", month_acts.len(), draw::dur(total))).color(draw::muted(ui)));
         for (id, title, sport, date) in month_acts {
             ui.horizontal(|ui| {

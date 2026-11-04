@@ -4,6 +4,15 @@ use chrono::{Datelike, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Adds up numbers starting from 0.0. (`sum` of no numbers gives -0.0, which shows as "-0".)
+pub trait Total: Iterator<Item = f64> + Sized {
+    fn total(self) -> f64 {
+        self.fold(0.0, |a, b| a + b)
+    }
+}
+
+impl<I: Iterator<Item = f64>> Total for I {}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Sport {
     Run,
@@ -303,12 +312,12 @@ pub struct Route {
 impl Route {
     pub fn distance_m(&self) -> f64 {
         if !self.geo.is_empty() {
-            return self.track().windows(2).map(|w| haversine(&w[0], &w[1])).sum();
+            return self.track().windows(2).map(|w| haversine(&w[0], &w[1])).total();
         }
         self.points
             .windows(2)
             .map(|w| ((w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])) as f64)
-            .sum()
+            .total()
     }
 
     /// The route's points as a track (no times), for drawing on the map.
@@ -558,7 +567,7 @@ impl Data {
             .iter()
             .filter(|a| a.gear == Some(id))
             .map(|a| a.distance_m)
-            .sum::<f64>()
+            .total()
             / 1000.0
     }
 
@@ -585,10 +594,10 @@ impl Data {
     pub fn goal_progress(&self, g: &Goal) -> f64 {
         let it = self.in_period(g.period, g.sport);
         match g.metric {
-            Metric::Distance => it.map(|a| a.distance_m).sum::<f64>() / 1000.0,
-            Metric::Time => it.map(|a| a.duration_s).sum::<f64>() / 3600.0,
+            Metric::Distance => it.map(|a| a.distance_m).total() / 1000.0,
+            Metric::Time => it.map(|a| a.duration_s).total() / 3600.0,
             Metric::Count => it.count() as f64,
-            Metric::Elevation => it.map(|a| a.elev_gain_m).sum::<f64>(),
+            Metric::Elevation => it.map(|a| a.elev_gain_m).total(),
         }
     }
 
@@ -1390,5 +1399,12 @@ mod tests {
         assert_eq!(s.theme(), MapTheme::Standard, "a chosen theme waits until themes are on");
         s.opt_themes = true;
         assert_eq!(s.theme(), MapTheme::Radar);
+    }
+
+    #[test]
+    fn totals_of_nothing_are_plain_zero() {
+        let t = std::iter::empty::<f64>().total();
+        assert!(t == 0.0 && t.is_sign_positive());
+        assert_eq!(format!("{:.0}", t / 1000.0), "0");
     }
 }

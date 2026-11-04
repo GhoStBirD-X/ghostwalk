@@ -2,7 +2,7 @@
 
 use crate::app::GhostApp;
 use crate::draw::{self, ACCENT};
-use crate::model::{Activity, Sport};
+use crate::model::{Activity, Sport, Total};
 use chrono::{Datelike, Local, Months, NaiveDate, Timelike};
 use eframe::egui::{RichText, Sense, Ui, vec2};
 
@@ -78,16 +78,16 @@ impl GhostApp {
             let days_in = (Local::now().date_naive() - span.0).num_days() + 1;
             prev_span.1 = prev_span.1.min(prev_span.0 + chrono::Duration::days(days_in));
         }
-        let prev_km: f64 = self.data.activities.iter().filter(|a| within(a, prev_span)).map(|a| a.distance_m).sum::<f64>();
+        let prev_km: f64 = self.data.activities.iter().filter(|a| within(a, prev_span)).map(|a| a.distance_m).total();
         if acts.is_empty() {
             draw::card(ui, |ui| {
                 ui.label("Belum ada aktivitas di periode ini.");
             });
             return;
         }
-        let dist: f64 = acts.iter().map(|a| a.distance_m).sum();
-        let time: f64 = acts.iter().map(|a| a.duration_s).sum();
-        let elev: f64 = acts.iter().map(|a| a.elev_gain_m).sum();
+        let dist: f64 = acts.iter().map(|a| a.distance_m).total();
+        let time: f64 = acts.iter().map(|a| a.duration_s).total();
+        let elev: f64 = acts.iter().map(|a| a.elev_gain_m).total();
         let steps: u64 = acts.iter().filter_map(|a| a.steps).map(u64::from).sum();
 
         draw::card(ui, |ui| {
