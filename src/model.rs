@@ -794,51 +794,72 @@ pub struct Turn {
     pub angle: f64,
 }
 
-/// The turns along `path`: corners where the heading changes by 35° or more. Points closer than
-/// 15 m to the previous corner are skipped, so a wobbly hand-drawn line does not count as turns.
+/// The turns along `path`: places where the heading 25 m before and 25 m after differ by 35° or
+/// more. Comparing over that distance finds a bend drawn with many points (a curve from GPS or
+/// a GPX file) as well as a sharp corner, and ignores small wobbles.
 pub fn turns(path: &[TrackPoint], cum: &[f64]) -> Vec<Turn> {
-    // Corners: indices at least 15 m apart.
-    let mut keep: Vec<usize> = Vec::new();
-    for i in 0..path.len() {
-        if keep.last().is_none_or(|&k| cum[i] - cum[k] >= 15.0) {
-            keep.push(i);
-        }
-    }
-    if let (Some(&k), Some(last)) = (keep.last(), path.len().checked_sub(1)) {
-        if k != last {
-            // The finish stays a corner of its own; the one just before it gives way.
-            if keep.len() > 1 && cum[last] - cum[k] < 15.0 {
-                keep.pop();
-            }
-            keep.push(last);
-        }
+    const WINDOW: f64 = 25.0;
+    const STEP: f64 = 5.0;
+    let total = cum.last().copied().unwrap_or(0.0);
+    if path.len() < 3 || total < 2.0 * WINDOW {
+        return Vec::new();
     }
     let heading = |a: &TrackPoint, b: &TrackPoint| {
         let cos = a.lat.to_radians().cos();
         ((b.lon - a.lon) * cos).atan2(b.lat - a.lat).to_degrees()
     };
-    let mut out = Vec::new();
-    for w in keep.windows(3) {
-        let (a, b, c) = (&path[w[0]], &path[w[1]], &path[w[2]]);
-        let mut d = heading(b, c) - heading(a, b);
-        while d > 180.0 {
-            d -= 360.0;
-        }
-        while d < -180.0 {
-            d += 360.0;
-        }
-        let angle = d.abs();
-        if angle < 35.0 {
-            continue;
-        }
+    // Every 5 m, and at each corner of the path, so a sharp corner is measured at its tip.
+    let mut at: Vec<f64> = (0..).map(|i| i as f64 * STEP).take_while(|d| *d <= total).chain(cum.iter().copied()).collect();
+    at.retain(|d| *d >= WINDOW && *d <= total - WINDOW);
+    at.sort_by(f64::total_cmp);
+    at.dedup();
+    let mut out: Vec<Turn> = Vec::new();
+    // The bend being followed: (where the sharpest point is, signed change there, where it last counted).
+    let mut bend: Option<(f64, f64, f64)> = None;
+    let close = |bend: (f64, f64, f64), out: &mut Vec<Turn>| {
+        let (d, change, _) = bend;
+        let angle = change.abs();
         let dir = if angle >= 150.0 {
             TurnDir::Back
-        } else if d > 0.0 {
+        } else if change > 0.0 {
             TurnDir::Right
         } else {
             TurnDir::Left
         };
-        out.push(Turn { at_m: cum[w[1]], dir, angle });
+        out.push(Turn { at_m: d, dir, angle });
+    };
+    for d in at {
+        let (a, b, c) = (point_along(path, cum, d - WINDOW), point_along(path, cum, d), point_along(path, cum, d + WINDOW));
+        let mut change = heading(&b, &c) - heading(&a, &b);
+        while change > 180.0 {
+            change -= 360.0;
+        }
+        while change < -180.0 {
+            change += 360.0;
+        }
+        let sharp = change.abs() >= 35.0;
+        match bend {
+            Some(mut bd) if d - bd.2 <= WINDOW && (!sharp || change.signum() == bd.1.signum()) => {
+                if sharp {
+                    if change.abs() > bd.1.abs() {
+                        (bd.0, bd.1) = (d, change);
+                    }
+                    bd.2 = d;
+                }
+                bend = Some(bd);
+            }
+            _ => {
+                if let Some(bd) = bend.take() {
+                    close(bd, &mut out);
+                }
+                if sharp {
+                    bend = Some((d, change, d));
+                }
+            }
+        }
+    }
+    if let Some(bd) = bend {
+        close(bd, &mut out);
     }
     out
 }
@@ -1325,6 +1346,23 @@ mod tests {
         let wobble: Vec<[f32; 2]> = (0..40).map(|i| [if i % 2 == 0 { 0.0 } else { 3.0 }, -(i as f32) * 10.0]).collect();
         let path = geo_track(&flat_to_geo(&wobble, (-6.2, 106.8)));
         assert!(turns(&path, &cumulative(&path)).is_empty());
+    }
+
+    #[test]
+    fn a_rounded_bend_is_one_turn() {
+        // North 300 m, a quarter circle of 40 m radius drawn every 2 m, then east 300 m.
+        let mut flat: Vec<[f32; 2]> = (0..=30).map(|i| [0.0, -(i as f32) * 10.0]).collect();
+        for k in 1..=31 {
+            let a = (k as f32 / 31.0) * std::f32::consts::FRAC_PI_2;
+            flat.push([40.0 - 40.0 * a.cos(), -300.0 - 40.0 * a.sin()]);
+        }
+        flat.extend((1..=30).map(|i| [40.0 + i as f32 * 10.0, -340.0]));
+        let path = geo_track(&flat_to_geo(&flat, (-6.2, 106.8)));
+        let cum = cumulative(&path);
+        let t = turns(&path, &cum);
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert_eq!(t[0].dir, TurnDir::Right);
+        assert!((t[0].at_m - 331.0).abs() < 20.0, "{t:?}");
     }
 
     #[test]

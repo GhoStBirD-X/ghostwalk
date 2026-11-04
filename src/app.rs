@@ -359,6 +359,26 @@ impl GhostApp {
             "settings" => (self.tab, self.sub) = (Tab::You, Some(Sub::Settings)),
             "summary" => (self.tab, self.sub) = (Tab::You, Some(Sub::Summary)),
             "onboarding" => self.data.settings.onboarded = false,
+            "turns" => {
+                // Halfway along the first side of a square route, with turn cues on.
+                self.tab = Tab::Record;
+                self.data.settings.opt_turn_cues = true;
+                let start = self.data.activities.iter().find_map(|a| a.track.first()).map_or((-6.19, 106.83), |p| (p.lat, p.lon));
+                let square = [[0.0, 0.0], [0.0, -400.0], [400.0, -400.0], [400.0, 0.0], [0.0, 0.0]];
+                let plan: Vec<model::TrackPoint> = model::flat_to_geo(&square, start)
+                    .iter()
+                    .map(|g| model::TrackPoint { lat: g[0], lon: g[1], ele: None, t: None })
+                    .collect();
+                let settings = self.data.settings.clone();
+                self.rec.begin(&settings);
+                self.rec.gps = 2;
+                self.rec.plan_cum = model::cumulative(&plan);
+                self.rec.turns = model::turns(&plan, &self.rec.plan_cum);
+                let cum = self.rec.plan_cum.clone();
+                self.rec.track = (0..=32).map(|i| model::point_along(&plan, &cum, i as f64 * 10.0)).collect();
+                self.rec.plan = plan;
+                self.rec.follow();
+            }
             "features" => {
                 // The settings with every optional feature switched on.
                 (self.tab, self.sub) = (Tab::You, Some(Sub::Settings));
@@ -783,7 +803,7 @@ impl GhostApp {
         if let Some((version, notes)) = self.whats_new.clone() {
             draw::card(ui, |ui| {
                 ui.label(RichText::new(format!("Yang baru di GhostWalk {version}")).family(draw::semi()).color(ACCENT));
-                crate::screens::release_notes(ui, &notes);
+                crate::screens::release_notes(ui, "whats_new_notes", &notes);
                 if ui.button("Tutup").clicked() {
                     self.whats_new = None;
                 }

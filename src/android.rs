@@ -303,6 +303,14 @@ pub fn update_install(path: &std::path::Path, sha256: &str) {
     });
 }
 
+/// Clears an earlier attempt's result before a new download.
+pub fn update_reset() {
+    with_class("id.ghostwalk.app.Updater", |env, cls, _| {
+        env.call_static_method(cls, "reset", "()V", &[])?;
+        Ok(())
+    });
+}
+
 /// How installing the update goes: (0 idle, 1 checking, 2 needs permission, 3 with Android, 4 failed; message).
 pub fn update_state() -> (i32, String) {
     with_class("id.ghostwalk.app.Updater", |env, cls, _| {

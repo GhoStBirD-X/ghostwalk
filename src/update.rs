@@ -56,7 +56,8 @@ fn spawn(ctx: &Ctx, start: Status, job: impl FnOnce(&Mutex<Status>, &Ctx) -> Sta
 fn agent() -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(300)))
+            // Slow phone connections need a while for the APK; the check itself is small.
+            .timeout_global(Some(Duration::from_secs(1200)))
             .user_agent(concat!("GhostWalk/", env!("CARGO_PKG_VERSION"), " (update check)"))
             .build(),
     )

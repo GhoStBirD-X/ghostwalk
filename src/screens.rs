@@ -1121,7 +1121,7 @@ impl GhostApp {
                 }
                 Some(Status::Available(r)) => {
                     ui.label(RichText::new(format!("Versi baru {} tersedia", r.version)).family(draw::semi()).color(ACCENT));
-                    release_notes(ui, &r.notes);
+                    release_notes(ui, "update_notes", &r.notes);
                     if cfg!(target_os = "android") {
                         ui.horizontal(|ui| {
                             let size = if r.size > 0 { format!(" ({:.1} MB)", r.size as f64 / 1e6) } else { String::new() };
@@ -1180,7 +1180,11 @@ impl GhostApp {
         drop(guard);
         match act {
             Some(Act::Check) => self.update_task = Some(update::check(ui.ctx())),
-            Some(Act::Download(r)) => self.update_task = Some(update::download(ui.ctx(), r)),
+            Some(Act::Download(r)) => {
+                #[cfg(target_os = "android")]
+                crate::android::update_reset();
+                self.update_task = Some(update::download(ui.ctx(), r));
+            }
             Some(Act::Later) => self.update_task = None,
             Some(Act::Install(r, path, sum)) => {
                 // Shown once after the update, from the new version.
@@ -1494,7 +1498,7 @@ fn mb(bytes: u64) -> String {
 }
 
 /// Release notes from GitHub, as plain text: Markdown marks taken off, at most a few lines tall.
-pub fn release_notes(ui: &mut Ui, notes: &str) {
+pub fn release_notes(ui: &mut Ui, id: &str, notes: &str) {
     if notes.is_empty() {
         return;
     }
@@ -1507,7 +1511,7 @@ pub fn release_notes(ui: &mut Ui, notes: &str) {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    egui::ScrollArea::vertical().max_height(180.0).id_salt("release_notes").show(ui, |ui| {
+    egui::ScrollArea::vertical().max_height(180.0).id_salt(id).show(ui, |ui| {
         ui.label(RichText::new(text.trim()).size(12.5));
     });
 }

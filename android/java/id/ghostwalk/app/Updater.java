@@ -43,6 +43,14 @@ public class Updater {
         return message;
     }
 
+    /** Forgets how the last attempt went, for a new download. */
+    public static void reset() {
+        if (state != 3) {
+            state = 0;
+            message = "";
+        }
+    }
+
     private static void fail(String why) {
         message = why;
         state = 4;
@@ -109,7 +117,8 @@ public class Updater {
             fail("File update tidak lebih baru dari versi terpasang.");
             return;
         }
-        if (!Arrays.equals(signer(apk), signer(installed))) {
+        byte[] theirs = signer(apk), mine = signer(installed);
+        if (theirs.length == 0 || mine.length == 0 || !Arrays.equals(theirs, mine)) {
             fail("File update tidak ditandatangani dengan kunci GhostWalk.");
         }
     }

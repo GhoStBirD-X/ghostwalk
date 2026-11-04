@@ -700,7 +700,13 @@ impl GhostApp {
                 turn_arrow(ui.painter(), r.center(), 18.0, t.dir, color);
                 ui.vertical(|ui| {
                     let left = (t.at_m - at).max(0.0);
-                    let when = if left < 15.0 { "Sekarang".to_string() } else { format!("Dalam {}", draw::dist(left, imp)) };
+                    let when = if left < 15.0 {
+                        "Sekarang".to_string()
+                    } else if !imp && left < 1000.0 {
+                        format!("Dalam {:.0} m", (left / 10.0).round() * 10.0)
+                    } else {
+                        format!("Dalam {}", draw::dist(left, imp))
+                    };
                     ui.label(RichText::new(when).size(12.5).color(draw::muted(ui)));
                     let mut words = t.dir.words().to_string();
                     words[..1].make_ascii_uppercase();
