@@ -126,6 +126,11 @@ pub fn heavy() -> FontFamily {
     FontFamily::Name("heavy".into())
 }
 
+/// A storybook serif, for the adventure map style.
+pub fn serif() -> FontFamily {
+    FontFamily::Name("serif".into())
+}
+
 /// Barlow for everything, with egui's own fonts behind it for symbols.
 pub fn install_fonts(ctx: &egui::Context) {
     let mut f = egui::FontDefinitions::default();
@@ -134,11 +139,15 @@ pub fn install_fonts(ctx: &egui::Context) {
         ("barlow", &include_bytes!("../assets/fonts/Barlow-Medium.ttf")[..]),
         ("barlow-semi", &include_bytes!("../assets/fonts/Barlow-SemiBold.ttf")[..]),
         ("barlow-heavy", &include_bytes!("../assets/fonts/Barlow-ExtraBold.ttf")[..]),
+        ("cormorant", &include_bytes!("../assets/fonts/CormorantSC-Bold.ttf")[..]),
     ] {
         f.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
     }
-    for (family, first) in [(FontFamily::Proportional, "barlow"), (semi(), "barlow-semi"), (heavy(), "barlow-heavy")] {
+    for (family, first) in [(FontFamily::Proportional, "barlow"), (semi(), "barlow-semi"), (heavy(), "barlow-heavy"), (serif(), "cormorant")] {
         let mut list = vec![first.to_string()];
+        if first == "cormorant" {
+            list.push("barlow-semi".into());
+        }
         list.extend(fallback.iter().cloned());
         f.families.insert(family, list);
     }
@@ -905,10 +914,17 @@ pub fn route_map(ui: &mut Ui, track: &[TrackPoint], color: Color32, height: f32,
     let dark = ui.visuals().dark_mode;
     let has_map = crate::offmap::draw(&p, rect, &view, dark);
     let line: Vec<Pos2> = pts.iter().map(|q| view.to_screen(*q)).collect();
-    p.line(line.clone(), Stroke::new(10.0, color.gamma_multiply(0.22)));
-    p.line(line.clone(), Stroke::new(3.5, color));
-    p.circle(line[0], 6.0, GREEN, Stroke::new(2.5, Color32::WHITE));
-    p.circle(*line.last().unwrap(), 6.0, RED, Stroke::new(2.5, Color32::WHITE));
+    if !crate::game::route_line(&p, &line, color) {
+        p.line(line.clone(), Stroke::new(10.0, color.gamma_multiply(0.22)));
+        p.line(line.clone(), Stroke::new(3.5, color));
+    }
+    if !crate::game::start(&p, line[0]) {
+        p.circle(line[0], 6.0, GREEN, Stroke::new(2.5, Color32::WHITE));
+    }
+    if !crate::game::finish(&p, apart(line[0], *line.last().unwrap())) {
+        p.circle(*line.last().unwrap(), 6.0, RED, Stroke::new(2.5, Color32::WHITE));
+    }
+    crate::game::decorate(&p, rect, has_map);
     if has_map {
         crate::offmap::attribution(&p, rect, dark);
     } else if interactive {
@@ -955,27 +971,49 @@ pub fn live_map(
     if pl.len() > 1 {
         let line: Vec<Pos2> = pl.iter().map(|q| view.to_screen(*q)).collect();
         let faint = if dark { Color32::from_gray(200) } else { Color32::from_gray(90) };
-        p.line(line.clone(), Stroke::new(7.0, faint.gamma_multiply(0.35)));
-        p.circle(line[0], 5.0, GREEN, Stroke::new(2.0, Color32::WHITE));
-        p.circle(*line.last().unwrap(), 5.0, RED, Stroke::new(2.0, Color32::WHITE));
+        if !crate::game::plan_line(&p, &line) {
+            p.line(line.clone(), Stroke::new(7.0, faint.gamma_multiply(0.35)));
+        }
+        if !crate::game::start(&p, line[0]) {
+            p.circle(line[0], 5.0, GREEN, Stroke::new(2.0, Color32::WHITE));
+        }
+        if !crate::game::finish(&p, apart(line[0], *line.last().unwrap())) {
+            p.circle(*line.last().unwrap(), 5.0, RED, Stroke::new(2.0, Color32::WHITE));
+        }
     }
     if tr.len() > 1 {
         let line: Vec<Pos2> = tr.iter().map(|q| view.to_screen(*q)).collect();
-        p.line(line.clone(), Stroke::new(10.0, color.gamma_multiply(0.22)));
-        p.line(line, Stroke::new(3.5, color));
+        if !crate::game::route_line(&p, &line, color) {
+            p.line(line.clone(), Stroke::new(10.0, color.gamma_multiply(0.22)));
+            p.line(line, Stroke::new(3.5, color));
+        }
     }
     if let Some(g) = gh {
         let at = view.to_screen(g);
-        p.circle(at, 7.5, GHOST, Stroke::new(2.5, Color32::WHITE));
-        p.text(at - vec2(0.0, 12.0), Align2::CENTER_BOTTOM, "hantu", FontId::new(11.0, semi()), GHOST);
+        if !crate::game::ghost(&p, at) {
+            p.circle(at, 7.5, GHOST, Stroke::new(2.5, Color32::WHITE));
+            p.text(at - vec2(0.0, 12.0), Align2::CENTER_BOTTOM, "hantu", FontId::new(11.0, semi()), GHOST);
+        }
     }
     if let Some(me) = tr.last() {
-        p.circle(view.to_screen(*me), 8.0, color, Stroke::new(3.0, Color32::WHITE));
+        let at = view.to_screen(*me);
+        // Heading from a point some metres back, so GPS jitter does not spin the marker.
+        let back = tr.iter().rev().map(|q| view.to_screen(*q)).find(|q| q.distance(at) > 6.0);
+        let dir = back.map_or(Vec2::ZERO, |b| at - b);
+        if !crate::game::me(&p, at, dir, color) {
+            p.circle(at, 8.0, color, Stroke::new(3.0, Color32::WHITE));
+        }
     }
+    crate::game::decorate(&p, rect, has_map);
     if has_map {
         crate::offmap::attribution(&p, rect, dark);
     }
     round_corners(&p, rect, 14.0, around);
+}
+
+/// Where to put a finish marker so it does not hide the start of a loop.
+fn apart(start: Pos2, finish: Pos2) -> Pos2 {
+    if start.distance(finish) < 16.0 { start + vec2(20.0, 0.0) } else { finish }
 }
 
 /// The route planner's map: the offline map around `center` (latitude, longitude), about 4 km
@@ -1006,13 +1044,17 @@ pub fn plan_map(ui: &mut Ui, center: (f64, f64), route: &[[f64; 2]], color: Colo
             view.to_screen([w[0] * EARTH_M, w[1] * EARTH_M])
         })
         .collect();
-    if line.len() > 1 {
+    if line.len() > 1 && !crate::game::route_line(&p, &line, color) {
         p.line(line.clone(), Stroke::new(4.0, color));
     }
     for (i, q) in line.iter().enumerate() {
+        if i == 0 && crate::game::start(&p, *q) {
+            continue;
+        }
         let c = if i == 0 { GREEN } else { Color32::WHITE };
         p.circle(*q, 5.0, c, Stroke::new(2.0, color));
     }
+    crate::game::decorate(&p, rect, has_map);
     if has_map {
         crate::offmap::attribution(&p, rect, dark);
     } else {

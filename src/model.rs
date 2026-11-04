@@ -414,11 +414,17 @@ pub enum MapTheme {
     Pixel,
     Radar,
     Snow,
+    /// A storybook adventure map, with its own markers and frame.
+    Adventurer,
+    /// A field map for an expedition, with its own markers and frame.
+    Hunter,
 }
 
 impl MapTheme {
-    pub const ALL: [MapTheme; 6] = [
+    pub const ALL: [MapTheme; 8] = [
         MapTheme::Standard,
+        MapTheme::Adventurer,
+        MapTheme::Hunter,
         MapTheme::Neon,
         MapTheme::Treasure,
         MapTheme::Pixel,
@@ -434,6 +440,8 @@ impl MapTheme {
             MapTheme::Pixel => "Piksel",
             MapTheme::Radar => "Radar",
             MapTheme::Snow => "Salju",
+            MapTheme::Adventurer => "Petualang",
+            MapTheme::Hunter => "Pemburu",
         }
     }
 }

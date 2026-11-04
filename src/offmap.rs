@@ -29,6 +29,13 @@ pub fn theme() -> MapTheme {
     MapTheme::ALL.get(THEME.load(Ordering::Relaxed) as usize).copied().unwrap_or_default()
 }
 
+/// The place name nearest the middle of the last map drawn, for a game-style banner.
+static AREA: Mutex<String> = Mutex::new(String::new());
+
+pub fn area_name() -> String {
+    AREA.lock().map(|a| a.clone()).unwrap_or_default()
+}
+
 /// Where map files live.
 pub fn dir() -> PathBuf {
     crate::model::data_dir().join("peta")
@@ -360,6 +367,36 @@ fn palette_for(theme: MapTheme, dark: bool) -> Palette {
             halo: rgb(30, 30, 30),
             widths: 1.5,
         },
+        MapTheme::Adventurer => Palette {
+            sea: rgb(126, 162, 160),
+            earth: rgb(228, 208, 164),
+            green: rgb(186, 190, 126),
+            sand: rgb(236, 218, 170),
+            building: rgb(210, 184, 136),
+            casing: rgb(122, 86, 48),
+            road: rgb(244, 232, 200),
+            highway: rgb(176, 112, 58),
+            path: rgb(152, 108, 62),
+            rail: rgb(104, 74, 46),
+            label: rgb(78, 44, 22),
+            halo: rgb(240, 226, 190),
+            widths: 1.0,
+        },
+        MapTheme::Hunter => Palette {
+            sea: rgb(40, 64, 72),
+            earth: rgb(60, 64, 50),
+            green: rgb(54, 76, 46),
+            sand: rgb(88, 80, 58),
+            building: rgb(76, 78, 62),
+            casing: rgb(32, 34, 26),
+            road: rgb(112, 106, 82),
+            highway: rgb(150, 142, 110),
+            path: rgb(98, 92, 70),
+            rail: rgb(92, 92, 72),
+            label: rgb(232, 220, 186),
+            halo: rgb(30, 32, 24),
+            widths: 0.9,
+        },
         MapTheme::Radar => Palette {
             sea: rgb(0, 26, 18),
             earth: rgb(4, 12, 8),
@@ -559,14 +596,27 @@ pub fn draw(p: &Painter, rect: Rect, v: &View, dark: bool) -> bool {
     }
 
     let mut used: Vec<Rect> = Vec::new();
+    let mut nearest: Option<(f32, &String)> = None;
+    let (family, upper) = match theme() {
+        MapTheme::Adventurer => (crate::draw::serif(), false),
+        MapTheme::Hunter => (crate::draw::semi(), true),
+        _ => (egui::FontFamily::Proportional, false),
+    };
     for (z, x, y, t) in &tiles {
         let to = place(*z, *x, *y);
         for (q, name, min_zoom) in &t.labels {
+            let at = to(*q);
+            let d = at.distance(rect.center());
+            // The closest name, even just outside the map, so a small map still gets one.
+            if d < rect.width() && nearest.is_none_or(|n| d < n.0) {
+                nearest = Some((d, name));
+            }
             if *min_zoom > zoom + 0.5 {
                 continue;
             }
-            let at = to(*q);
-            let font = FontId::proportional(11.5);
+            let font = FontId::new(if family == egui::FontFamily::Proportional { 11.5 } else { 12.5 }, family.clone());
+            let shown = if upper { name.to_uppercase() } else { name.clone() };
+            let name = &shown;
             let galley = p.layout_no_wrap(name.clone(), font.clone(), pal.label);
             let r = Align2::CENTER_CENTER.anchor_size(at, galley.size()).expand(3.0);
             if !rect.contains_rect(r) || used.iter().any(|u| u.intersects(r)) {
@@ -578,6 +628,9 @@ pub fn draw(p: &Painter, rect: Rect, v: &View, dark: bool) -> bool {
             }
             p.text(at, Align2::CENTER_CENTER, name, font, pal.label);
         }
+    }
+    if let Ok(mut a) = AREA.lock() {
+        *a = nearest.map(|n| n.1.clone()).unwrap_or_default();
     }
     true
 }

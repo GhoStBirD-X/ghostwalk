@@ -2,6 +2,7 @@
 
 mod app;
 mod draw;
+mod game;
 mod gpx;
 mod mapdl;
 mod model;
@@ -50,6 +51,12 @@ pub fn run_desktop(screenshot: Option<std::path::PathBuf>) -> eframe::Result {
             let mut app = app::GhostApp::new(cc, screenshot);
             if let Ok(screen) = std::env::var("GHOSTWALK_SCREEN") {
                 app.open_start_screen(&screen);
+            }
+            // A map theme for the check pictures, by its name in the code (e.g. "Hunter").
+            if let Ok(t) = std::env::var("GHOSTWALK_THEME")
+                && let Ok(t) = serde_json::from_str(&format!("\"{t}\""))
+            {
+                (app.data.settings.opt_themes, app.data.settings.map_theme) = (true, t);
             }
             Ok(Box::new(app))
         }),

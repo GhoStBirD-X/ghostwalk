@@ -14,7 +14,7 @@ Pencatat olahraga yang **pribadi dan offline** untuk Android dan komputer (Linux
 - **Rute**: buat rute sendiri, lalu lari mengikutinya: rute tampil di peta saat merekam, dengan sisa jarak dan peringatan (suara dan getar) saat keluar rute. Peta jejak semua aktivitas.
 - **Lawan hantu**: berlomba dengan lari Anda sebelumnya. Titik hantu bergerak di peta, selisih detik terlihat setiap saat, dan di setiap km terdengar apakah Anda di depan atau di belakang hantu, juga saat layar mati.
 - **Data milik Anda**: ekspor GPX dan CSV, cadangkan dan pulihkan dalam JSON.
-- **Fitur pilihan** (mati sampai dinyalakan di Pengaturan): tema peta (Neon Malam, Peta Harta, Piksel, Radar, Salju), panduan belokan saat mengikuti rute ("Dalam 100 meter, belok kiri"), dan update di dalam app yang memeriksa SHA-256, nama paket, dan tanda tangan sebelum memasang.
+- **Fitur pilihan** (mati sampai dinyalakan di Pengaturan): tema peta (gaya game **Petualang** dan **Pemburu** dengan bingkai, spanduk nama daerah, jejak rute, dan penanda sendiri, plus Neon Malam, Peta Harta, Piksel, Radar, Salju), panduan belokan saat mengikuti rute ("Dalam 100 meter, belok kiri"), dan update di dalam app yang memeriksa SHA-256, nama paket, dan tanda tangan sebelum memasang.
 - Tema gelap dan terang, bahasa Indonesia.
 
 ## Privasi
@@ -60,3 +60,4 @@ python3 tools/make_wilayah.py ID.txt assets/wilayah.tsv.gz
 - Peta: © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors (ODbL), melalui build [Protomaps](https://protomaps.com).
 - Daftar wilayah: [GeoNames](https://www.geonames.org) (CC BY 4.0).
 - Font: [Barlow](https://github.com/jpt/barlow) (SIL Open Font License 1.1, lihat `assets/fonts/OFL.txt`).
+- Font peta Petualang: [Cormorant SC](https://github.com/CatharsisFonts/Cormorant) (SIL Open Font License 1.1, lihat `assets/fonts/OFL-Cormorant.txt`).
