@@ -1507,7 +1507,8 @@ pub fn release_notes(ui: &mut Ui, id: &str, notes: &str) {
         .map(|l| {
             let l = l.trim_start_matches('#').trim();
             let l = l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")).map_or(l.to_string(), |r| format!("• {r}"));
-            l.replace("**", "").replace('`', "")
+            // The app's font has no arrows; "›" is in it.
+            l.replace("**", "").replace('`', "").replace(['→', '⇒'], "›")
         })
         .collect::<Vec<_>>()
         .join("\n");
